@@ -8,12 +8,12 @@ use async_graphql::{
 };
 use dotenv::dotenv;
 use futures::future::*;
+use itertools::Itertools;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 use std::borrow::Borrow;
 use std::env;
 use std::fmt::format;
 use uuid::*;
-use itertools::Itertools;
 
 #[derive(Debug, Clone)]
 struct Table {
@@ -25,10 +25,11 @@ struct Table {
 
 impl Table {
     fn get_all_columns(&self) -> impl Iterator<Item = &Column> {
-        self.columns.iter().chain(self.primary_keys.iter().map(|pk|&pk.0))
+        self.columns
+            .iter()
+            .chain(self.primary_keys.iter().map(|pk| &pk.0))
     }
 }
-
 
 #[derive(Debug, Clone)]
 struct Column {
@@ -48,9 +49,21 @@ struct ColumnName(String);
 struct RelationshipName(String);
 
 enum Relationship {
-    OneToOne { foreign_table_name: String, foreign_column_name: String, relationship_name: String },
-    OneToMany { foreign_table_name: String, foreign_column_name: String, relationship_name: String },
-    ManyToOne { foreign_table_name: String, foreign_column_name: String, relationship_name: String },
+    OneToOne {
+        foreign_table_name: String,
+        foreign_column_name: String,
+        relationship_name: String,
+    },
+    OneToMany {
+        foreign_table_name: String,
+        foreign_column_name: String,
+        relationship_name: String,
+    },
+    ManyToOne {
+        foreign_table_name: String,
+        foreign_column_name: String,
+        relationship_name: String,
+    },
 }
 
 struct TableRelationship {
@@ -65,9 +78,15 @@ struct TableRelationship {
 impl Relationship {
     fn get_relationship_name(&self) -> String {
         match self {
-            Relationship::OneToOne { relationship_name, .. } => { relationship_name.to_string() }
-            Relationship::OneToMany { relationship_name, .. } => { relationship_name.to_string() }
-            Relationship::ManyToOne { relationship_name, .. } => { relationship_name.to_string() }
+            Relationship::OneToOne {
+                relationship_name, ..
+            } => relationship_name.to_string(),
+            Relationship::OneToMany {
+                relationship_name, ..
+            } => relationship_name.to_string(),
+            Relationship::ManyToOne {
+                relationship_name, ..
+            } => relationship_name.to_string(),
         }
     }
 }
@@ -373,7 +392,7 @@ async fn main() -> Result<(), String> {
     let wut = parse_query(
         std::fs::read_to_string("./example_getby_id.graphql").map_err(|err| err.to_string())?,
     )
-        .map_err(|err| err.to_string())?;
+    .map_err(|err| err.to_string())?;
 
     println!("{:#?}", wut);
 
@@ -470,7 +489,9 @@ impl TableSelection {
         let column_lines = self
             .column_names
             .iter()
-            .map(|col_name| format!(r#"select "{}"."{}" as "{}" "#, data_id, col_name, col_name).to_string())
+            .map(|col_name| {
+                format!(r#"select "{}"."{}" as "{}" "#, data_id, col_name, col_name).to_string()
+            })
             .join(",\n");
 
         format!(
@@ -502,19 +523,24 @@ enum SearchPlace {
     Relationship,
 }
 
-
-fn field_to_table_selection(field: &Field, tables: &Vec<Table>, search_place: &SearchPlace, relationships: &Vec<TableRelationship>) -> TableSelection {
-    let table =match search_place {
-        SearchPlace::TopLevel => {
-            tables.iter().find(|table| table.toplevel_ops.contains(&field.response_key().node.to_string()))
-        }
-        SearchPlace::Relationship => {
-            relationships
-                .iter()
-                .find(|relationship| relationship.field_name.eq(&field.name.node.to_string()))
-                .map(|rel| &rel.foreign_table)
-        }
-    }.expect("No table found");
+fn field_to_table_selection(
+    field: &Field,
+    tables: &Vec<Table>,
+    search_place: &SearchPlace,
+    relationships: &Vec<TableRelationship>,
+) -> TableSelection {
+    let table = match search_place {
+        SearchPlace::TopLevel => tables.iter().find(|table| {
+            table
+                .toplevel_ops
+                .contains(&field.response_key().node.to_string())
+        }),
+        SearchPlace::Relationship => relationships
+            .iter()
+            .find(|relationship| relationship.field_name.eq(&field.name.node.to_string()))
+            .map(|rel| &rel.foreign_table),
+    }
+    .expect("No table found");
 
     let columns: Vec<String> = field
         .selection_set
@@ -523,7 +549,12 @@ fn field_to_table_selection(field: &Field, tables: &Vec<Table>, search_place: &S
         .iter()
         .map(|Positioned { node, .. }| inner(node))
         .map(|f| f.response_key().node.to_string())
-        .filter(|col_name| table.get_all_columns().find(|col| col.name.eq(col_name)).is_some())
+        .filter(|col_name| {
+            table
+                .get_all_columns()
+                .find(|col| col.name.eq(col_name))
+                .is_some()
+        })
         .collect();
 
     let joins = field
@@ -538,22 +569,30 @@ fn field_to_table_selection(field: &Field, tables: &Vec<Table>, search_place: &S
     let selected_joins = joins
         .iter()
         .map(|field| {
-            (field_to_table_selection(field, tables, &SearchPlace::Relationship, relationships), field)
-        }).map(|(joined_table, field)| {
-        let join_relationship = relationships.iter().find(|relationship| {
-            relationship.table.name == table.name &&
-                relationship.foreign_table.name == joined_table.table_name &&
-                relationship.field_name == field.name.node.to_string()
-        }).expect("Unable to find relationship");
+            (
+                field_to_table_selection(field, tables, &SearchPlace::Relationship, relationships),
+                field,
+            )
+        })
+        .map(|(joined_table, field)| {
+            let join_relationship = relationships
+                .iter()
+                .find(|relationship| {
+                    relationship.table.name == table.name
+                        && relationship.foreign_table.name == joined_table.table_name
+                        && relationship.field_name == field.name.node.to_string()
+                })
+                .expect("Unable to find relationship");
 
-        LeftJoin {
-            right_table: joined_table,
-            join_conditions: vec![JoinCondition {
-                left_col: join_relationship.column.name.to_owned(),
-                right_col: join_relationship.foreign_column.name.to_owned(),
-            }],
-        }
-    }).collect_vec();
+            LeftJoin {
+                right_table: joined_table,
+                join_conditions: vec![JoinCondition {
+                    left_col: join_relationship.column.name.to_owned(),
+                    right_col: join_relationship.foreign_column.name.to_owned(),
+                }],
+            }
+        })
+        .collect_vec();
     TableSelection {
         left_joins: selected_joins,
         column_names: columns,
@@ -561,7 +600,11 @@ fn field_to_table_selection(field: &Field, tables: &Vec<Table>, search_place: &S
     }
 }
 
-fn to_intermediate(query: &ExecutableDocument, tables: &Vec<Table>, relationships: &Vec<TableRelationship>) -> Vec<TableSelection> {
+fn to_intermediate(
+    query: &ExecutableDocument,
+    tables: &Vec<Table>,
+    relationships: &Vec<TableRelationship>,
+) -> Vec<TableSelection> {
     let ops = query
         .operations
         .iter()
@@ -590,11 +633,10 @@ fn to_intermediate(query: &ExecutableDocument, tables: &Vec<Table>, relationship
                             .map(|Positioned { node, .. }| inner(node))
                             .map(|f| f.response_key().node.to_string())
                             .filter(|col_name| {
-                                table.columns
+                                table
+                                    .columns
                                     .iter()
-                                    .chain(table.primary_keys
-                                        .iter()
-                                        .map(|pk| &pk.0))
+                                    .chain(table.primary_keys.iter().map(|pk| &pk.0))
                                     .find(|col| col.name.eq(col_name))
                                     .is_some()
                             })
@@ -607,18 +649,36 @@ fn to_intermediate(query: &ExecutableDocument, tables: &Vec<Table>, relationship
                             .iter()
                             .map(|Positioned { node, .. }| inner(node))
                             .filter(|field| field.selection_set.node.items.len() > 0)
-                            .map(|field| (field_to_table_selection(&field, tables, &SearchPlace::Relationship, relationships), field))
+                            .map(|field| {
+                                (
+                                    field_to_table_selection(
+                                        &field,
+                                        tables,
+                                        &SearchPlace::Relationship,
+                                        relationships,
+                                    ),
+                                    field,
+                                )
+                            })
                             .map(|(tableselection, field)| {
-                                let join_relationship = relationships.iter().find(|relationship| {
-                                    relationship.table.name == table.name &&
-                                        relationship.foreign_table.name == tableselection.table_name &&
-                                        relationship.field_name == field.name.node.to_string()
-                                }).expect("Unable to find relationship");
+                                let join_relationship = relationships
+                                    .iter()
+                                    .find(|relationship| {
+                                        relationship.table.name == table.name
+                                            && relationship.foreign_table.name
+                                                == tableselection.table_name
+                                            && relationship.field_name
+                                                == field.name.node.to_string()
+                                    })
+                                    .expect("Unable to find relationship");
 
                                 LeftJoin {
                                     right_table: tableselection,
                                     join_conditions: vec![JoinCondition {
-                                        right_col: join_relationship.foreign_column.name.to_string(),
+                                        right_col: join_relationship
+                                            .foreign_column
+                                            .name
+                                            .to_string(),
                                         left_col: join_relationship.column.name.to_string(),
                                     }],
                                 }
@@ -635,13 +695,16 @@ fn to_intermediate(query: &ExecutableDocument, tables: &Vec<Table>, relationship
                     Selection::InlineFragment(_) => todo!(),
                 },
             )
-        }).collect_vec()
+        })
+        .collect_vec()
 }
-
 
 #[cfg(test)]
 mod tests {
-    use crate::{to_sql, Relationship, to_intermediate, SearchPlace, TableRelationship, TableSelection, LeftJoin, JoinCondition};
+    use crate::{
+        to_intermediate, to_sql, JoinCondition, LeftJoin, Relationship, SearchPlace,
+        TableRelationship, TableSelection,
+    };
 
     use crate::Column;
     use crate::PrimaryKey;
@@ -692,12 +755,15 @@ mod tests {
         };
         let tables = vec![
             Table {
-                columns: vec![Column {
-                    name: "content".to_string(),
-                    datatype: "text".to_string(),
-                    required: false,
-                    unique: false,
-                }, author_col.to_owned()],
+                columns: vec![
+                    Column {
+                        name: "content".to_string(),
+                        datatype: "text".to_string(),
+                        required: false,
+                        unique: false,
+                    },
+                    author_col.to_owned(),
+                ],
                 primary_keys: vec![PrimaryKey(Column {
                     name: "id".to_string(),
                     datatype: "uuid".to_string(),
@@ -758,10 +824,7 @@ mod tests {
 
         let expected = vec![TableSelection {
             table_name: "example".to_string(),
-            column_names: vec![
-                "id".to_string(),
-                "number".to_string(),
-            ],
+            column_names: vec!["id".to_string(), "number".to_string()],
             left_joins: vec![],
         }];
 
@@ -789,33 +852,21 @@ mod tests {
         let (tables, relationships) = two_tables();
         let intermediate = to_intermediate(&parsed_query, &tables, &relationships);
 
-        let expected = vec![
-            TableSelection {
-                table_name: "posts".to_string(),
-                column_names: vec![
-                    "id".to_string(),
-                    "content".to_string(),
-                ],
-                left_joins: vec![
-                    LeftJoin {
-                        right_table: TableSelection {
-                            table_name: "users".to_string(),
-                            column_names: vec![
-                                "id".to_string(),
-                                "name".to_string(),
-                            ],
-                            left_joins: vec![],
-                        },
-                        join_conditions: vec![
-                            JoinCondition {
-                                left_col: "author".to_string(),
-                                right_col: "id".to_string(),
-                            },
-                        ],
-                    },
-                ],
-            },
-        ];
+        let expected = vec![TableSelection {
+            table_name: "posts".to_string(),
+            column_names: vec!["id".to_string(), "content".to_string()],
+            left_joins: vec![LeftJoin {
+                right_table: TableSelection {
+                    table_name: "users".to_string(),
+                    column_names: vec!["id".to_string(), "name".to_string()],
+                    left_joins: vec![],
+                },
+                join_conditions: vec![JoinCondition {
+                    left_col: "author".to_string(),
+                    right_col: "id".to_string(),
+                }],
+            }],
+        }];
 
         assert_eq!(intermediate, expected);
     }
