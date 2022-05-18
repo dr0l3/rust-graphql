@@ -1,0 +1,7 @@
+query get_example($id: Uuid!) {
+  get_example_by_id(id: $id) {
+    id
+    txt
+    number
+  }
+}
