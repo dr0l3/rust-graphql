@@ -1,3 +1,5 @@
+mod postgres_introspect;
+
 extern crate dotenv;
 
 use async_graphql::{
@@ -9,10 +11,12 @@ use async_graphql::{
 use dotenv::dotenv;
 use futures::future::*;
 use itertools::Itertools;
+use postgres_introspect::{convert_introspect_data, fetch_introspection_data};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 use std::borrow::Borrow;
 use std::env;
-use std::fmt::format;
+use std::fmt::{format, Display, Formatter};
+use std::ops::Add;
 use uuid::*;
 
 #[derive(Debug, Clone)]
@@ -20,7 +24,13 @@ struct Table {
     name: String,
     columns: Vec<Column>,
     primary_keys: Vec<PrimaryKey>,
-    toplevel_ops: Vec<String>,
+    toplevel_ops: Vec<Op>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Op {
+    name: String,
+    return_type: ReturnType,
 }
 
 impl Table {
@@ -50,11 +60,15 @@ struct RelationshipName(String);
 
 enum Relationship {
     OneToOne {
+        table_name: String,
+        column_name: String,
         foreign_table_name: String,
         foreign_column_name: String,
         relationship_name: String,
     },
     OneToMany {
+        table_name: String,
+        column_name: String,
         foreign_table_name: String,
         foreign_column_name: String,
         relationship_name: String,
@@ -63,9 +77,30 @@ enum Relationship {
         foreign_table_name: String,
         foreign_column_name: String,
         relationship_name: String,
+        table_name: String,
+        column_name: String,
     },
 }
 
+// cases
+// - column is optional -> GraphQL type is wrapped optional
+// - column is not optional -> GraphQL type is not wrapped in optional
+// - target_column is unique -> GraphQL type is an object
+// - target_column is not unique -> GraphQL type is an array
+
+#[derive(Debug, Clone)]
+pub struct Relationship2 {
+    table_name: String,
+    column_name: String,
+    target_table_name: String,
+    target_column_name: String,
+    field_name: String,
+    return_type: ReturnType,
+    column_optional: bool,
+}
+
+// really a two way relationship
+#[derive(Debug, Clone)]
 struct TableRelationship {
     table: Table,
     column: Column,
@@ -73,6 +108,8 @@ struct TableRelationship {
     foreign_column: Column,
     constraint_name: String,
     field_name: String,
+    //table_to_foreign_field_name
+    //foreign_to
 }
 
 impl Relationship {
@@ -92,7 +129,7 @@ impl Relationship {
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
-struct TableRow {
+pub struct TableRow {
     schema: String,
     name: String,
     table_type: String,
@@ -102,7 +139,7 @@ struct TableRow {
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
-struct TableColumm {
+pub struct TableColumm {
     column_name: String,
     table_name: String,
     is_nullable: String,
@@ -110,7 +147,7 @@ struct TableColumm {
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
-struct TableReferences {
+pub struct TableReferences {
     table_schema: String,
     table_name: String,
     column_name: String,
@@ -120,275 +157,21 @@ struct TableReferences {
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
-struct TableView {
+pub struct TableView {
     table_schema: String,
     table_name: String,
     is_updatable: String,
     is_insertable_into: String,
 }
 
-#[derive(Debug)]
-struct User {
-    id: Uuid,
-    name: Option<String>,
-    email: String,
+#[derive(sqlx::FromRow, Debug, Clone)]
+struct TableUniqueConstraint {
+    schema_name: String,
+    table_name: String,
+    column_name: String,
 }
 
-struct Conversation {
-    id: Uuid,
-    requester: Uuid,
-    state: String,
-}
-
-struct Message {
-    id: Uuid,
-    conversation_id: Uuid,
-    content: String,
-    author: Uuid,
-}
-
-struct Queue {
-    id: Uuid,
-    name: String,
-}
-
-struct QueuedConversation {
-    csid: Uuid,
-    queue_id: Uuid,
-}
-
-struct Test {
-    something: String,
-    something_else: String,
-}
-
-#[Object]
-impl Test {
-    async fn something(&self) -> String {
-        println!("Fetching something");
-        self.something.to_string()
-    }
-
-    async fn something_else(&self) -> String {
-        println!("Fetching something else");
-        self.something_else.to_string()
-    }
-}
-
-async fn get_tables(pool: &Pool<Postgres>) -> Result<Vec<TableRow>, sqlx::Error> {
-    let sql = r#"SELECT n.nspname as "schema",
-    c.relname as "name",
-    CASE c.relkind 
-      WHEN 'r' THEN 'table' 
-      WHEN 'v' THEN 'view' 
-      WHEN 'm' THEN 'materialized view' 
-      WHEN 'i' THEN 'index' 
-      WHEN 'S' THEN 'sequence' 
-      WHEN 's' THEN 'special' 
-      WHEN 'f' THEN 'foreign table' 
-      WHEN 'p' THEN 'partitioned table' 
-      WHEN 'I' THEN 'partitioned index' 
-    END as "table_type",
-    pg_catalog.pg_get_userbyid(c.relowner) as "owner",
-    pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as "size",
-    pg_catalog.obj_description(c.oid, 'pg_class') as "description"
-  FROM pg_catalog.pg_class c
-       LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-  WHERE c.relkind IN ('r','p','s','')
-        AND n.nspname = 'public'
-  ORDER BY 1,2;"#;
-    Ok(sqlx::query_as::<_, TableRow>(sql).fetch_all(pool).await?)
-}
-
-async fn get_columns(
-    pool: &Pool<Postgres>,
-    table: String,
-) -> Result<Vec<TableColumm>, sqlx::Error> {
-    let sql = "SELECT *
-    FROM information_schema.columns
-   WHERE table_schema = 'public'
-     AND table_name   = $1
-       ;";
-    println!("fetching columns for table {:#?}", table);
-
-    Ok(sqlx::query_as::<_, TableColumm>(sql)
-        .bind(table)
-        .fetch_all(pool)
-        .await?)
-}
-
-async fn get_references(
-    pool: &Pool<Postgres>,
-    table: String,
-) -> Result<Vec<TableReferences>, sqlx::Error> {
-    let sql = "SELECT
-    tc.table_schema, 
-    tc.constraint_name, 
-    tc.table_name, 
-    kcu.column_name, 
-    ccu.table_schema AS foreign_table_schema,
-    ccu.table_name AS foreign_table_name,
-    ccu.column_name AS foreign_column_name 
-FROM 
-    information_schema.table_constraints AS tc 
-    JOIN information_schema.key_column_usage AS kcu
-      ON tc.constraint_name = kcu.constraint_name
-      AND tc.table_schema = kcu.table_schema
-    JOIN information_schema.constraint_column_usage AS ccu
-      ON ccu.constraint_name = tc.constraint_name
-      AND ccu.table_schema = tc.table_schema
-WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name=$1;";
-
-    Ok(sqlx::query_as(sql).bind(table).fetch_all(pool).await?)
-}
-
-async fn get_views(pool: &Pool<Postgres>) -> Result<Vec<TableView>, sqlx::Error> {
-    let sql = "select * from information_schema.views where table_schema = 'public';";
-
-    Ok(sqlx::query_as(sql).fetch_all(pool).await?)
-}
-
-struct Query;
-
-struct JsonValue(serde_json::Value);
-
-struct JsonResponse {
-    value: JsonValue,
-    type_name: String,
-    type_info: String,
-}
-
-async fn compute<'life1, 'life2, 'life3>(
-    ctx: &'life1 ContextSelectionSet<'life2>,
-    field: &'life3 Positioned<parser::types::Field>,
-) -> Result<Value, ServerError> {
-    println!("{:#?}", "hello");
-    println!("{:#?}", field);
-
-    Ok(async_graphql::Value::String("".to_string()))
-}
-
-struct ConversationValue(serde_json::Value);
-
-/*impl OutputType for ConversationValue {
-    fn type_name() -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("Conversation")
-    }
-
-    fn create_type_info(registry: &mut registry::Registry) -> String {
-        let fields: indexmap::IndexMap<String, async_graphql::registry::MetaField> =
-            indexmap::IndexMap::new();
-
-
-        registry.create_output_type::<ConversationValue, _>(registry::MetaTypeId::Object, |_| {
-            registry::MetaType::Object {
-                name: "Converation".to_string(),
-                description: Some("A Conversation"),
-                fields: fields,
-                cache_control: CacheControl {
-                    public: false,
-                    max_age: 0,
-                },
-                extends: false,
-                keys: None,
-                visible: None,
-                is_subscription: false,
-                rust_typename: "ConversationValue",
-            }
-        });
-        "Conversation".to_string()
-    }
-
-    fn resolve<'life0, 'life1, 'life2, 'life3, 'async_trait>(
-        &'life0 self,
-        ctx: &'life1 ContextSelectionSet<'life2>,
-        field: &'life3 Positioned<parser::types::Field>,
-    ) -> core::pin::Pin<
-        Box<
-            dyn core::future::Future<Output = ServerResult<Value>>
-                + core::marker::Send
-                + 'async_trait,
-        >,
-    >
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        'life2: 'async_trait,
-        'life3: 'async_trait,
-        Self: 'async_trait,
-    {
-        todo!()
-    }
-}
-
-impl OutputType for JsonValue {
-    fn type_name() -> std::borrow::Cow<'static, str> {
-        Self::type_name()
-        //std::borrow::Cow::Borrowed("hehe")
-    }
-
-    fn qualified_type_name() -> String {
-        format!("{}!", Self::type_name())
-    }
-
-    fn introspection_type_name(&self) -> std::borrow::Cow<'static, str> {
-        Self::type_name()
-    }
-
-    fn create_type_info(registry: &mut registry::Registry) -> String {
-        "todo!()".to_string()
-    }
-
-    fn resolve<'life0, 'life1, 'life2, 'life3, 'async_trait>(
-        &'life0 self,
-        ctx: &'life1 ContextSelectionSet<'life2>,
-        field: &'life3 Positioned<parser::types::Field>,
-    ) -> core::pin::Pin<
-        Box<
-            dyn core::future::Future<Output = ServerResult<Value>>
-                + core::marker::Send
-                + 'async_trait,
-        >,
-    >
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        'life2: 'async_trait,
-        'life3: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(compute(ctx, field))
-    }
-}*/
-
-#[Object]
-impl Query {
-    async fn add(&self, ctx: &Context<'_>, a: i32, b: i32) -> i32 {
-        let meh = ctx.field();
-        println!("{:#?}", meh);
-        a + b
-    }
-}
-
-#[derive(Debug)]
-enum Whatever {
-    Hello,
-    World,
-    This,
-    Is,
-    Dog,
-}
-
-#[tokio::main]
-async fn main() -> Result<(), String> {
-    let schema = Schema::new(Query, EmptyMutation, EmptySubscription);
-
-    let res = schema.execute("{ add(a: 10, b: 20)}").await;
-
-    println!("{:#?}", res);
-
-    println!("{}", &schema.sdl());
-
+fn test_something() -> Result<(), String> {
     let wut = parse_query(
         std::fs::read_to_string("./example_getby_id.graphql").map_err(|err| err.to_string())?,
     )
@@ -418,24 +201,30 @@ async fn main() -> Result<(), String> {
             unique: true,
         })],
         name: "example".to_string(),
-        toplevel_ops: vec!["get_example_by_id".to_string()],
+        toplevel_ops: vec![Op {
+            name: "get_example_by_id".to_string(),
+            return_type: ReturnType::Object,
+        }],
     }];
+    Ok(())
+}
 
-    let sql = to_sql(wut, tables);
+#[tokio::main]
+async fn main() -> Result<(), String> {
+    //test_something();
 
-    let something: Whatever = todo!();
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect("postgres://postgres:postgres@0.0.0.0:5439/dixa")
+        .map_err(|err| err.to_string())
+        .await?;
+    let (tables, constraints, columns, references) = fetch_introspection_data(&pool)
+        .map_err(|err| err.to_string())
+        .await?;
+    let results =
+        convert_introspect_data(tables, constraints, columns, references).map_err(|err| "Wut")?;
 
-    println!("{:#?}", something);
-
-    match something {
-        Whatever::Hello => {}
-        Whatever::World => {}
-        Whatever::This => {}
-        Whatever::Is => {}
-        Whatever::Dog => {}
-    }
-
-    println!("{:#?}", sql);
+    println!("{:#?}", results);
 
     Ok(())
 }
@@ -445,6 +234,10 @@ struct TableSelection {
     table_name: String,
     column_names: Vec<String>,
     left_joins: Vec<LeftJoin>,
+    where_clauses: Vec<WhereClause>,
+    return_type: ReturnType,
+    field_name: String,
+    path: String,
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -459,13 +252,171 @@ struct JoinCondition {
     right_col: String,
 }
 
+#[derive(Debug)]
+struct DataId {
+    horizontal: usize,
+    vertical: usize,
+}
+
+impl Display for DataId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.horizontal, self.vertical)
+    }
+}
+
+impl DataId {
+    fn next_horizontal(&self) -> DataId {
+        DataId {
+            horizontal: self.horizontal + 1,
+            vertical: self.vertical,
+        }
+    }
+
+    fn next_vertical(&self) -> DataId {
+        DataId {
+            horizontal: self.horizontal,
+            vertical: self.vertical + 1,
+        }
+    }
+
+    fn advanced_vertical(&self, n: usize) -> DataId {
+        DataId {
+            horizontal: self.horizontal,
+            vertical: self.vertical + n,
+        }
+    }
+
+    fn advanced_horizontal(&self, n: usize) -> DataId {
+        DataId {
+            horizontal: self.horizontal + n,
+            vertical: self.vertical,
+        }
+    }
+
+    fn to_id(&self) -> String {
+        String::from(format!("{}{}", self.horizontal, self.vertical))
+    }
+}
+
+/*
+
+The cases
+
+# Return type
+## Object
+
+
+```sql
+SELECT coalesce((json_agg("root") -> 0), 'null') AS "root"
+from
+    select row_to_json(
+        (
+            select "json_spec"
+            from (
+                select
+                    "user_data"."id" as "id",
+                    "user_data"."email" as "email",
+                    "user_data"."birthday" as "birthday"
+                ) as "json_spec")) as "root"
+    from (select * from users where id 'some-uuid') as "user_data"
+```
+
+## List/Array
+
+```sql
+select coalesce(json_agg("root"), '[]') as "root"
+from
+    select row_to_json(
+        (
+            select "json_spec"
+            from (
+                select
+                    "user_data"."id" as "id",
+                    "user_data"."email" as "email",
+                    "user_data"."birthday" as "birthday"
+                ) as "json_spec")) as "root"
+    from (select * from users) as "user_data"
+```
+
+# JOin structure
+
+## Object
+```sql
+SELECT coalesce((json_agg("root") -> 0), 'null') AS "root"
+from
+    select row_to_json(
+        (
+            select "json_spec"
+            from (
+                select
+                    "user_data"."id" as "id",
+                    "user_data"."email" as "email",
+                    "user_data"."birthday" as "birthday",
+                    "user_orders"."orders" as "orders"
+                ) as "json_spec")) as "root"
+    from
+        (select * from users where id 'some-uuid') as "user_data"
+        left outer join lateral (
+            SELECT
+                    coalesce(json_agg("orders"), '[]') AS "orders"
+            FROM
+                (
+                    SELECT row_to_json(
+                            (
+                                SELECT
+                                    "json_spec"
+                                FROM (
+                                    SELECT
+                                            "order_data"."id" AS "id",
+                                            "order_data"."time" AS "time"
+                                    ) AS "json_spec")) AS "orders"
+                        FROM
+                            (SELECT * FROM "public"."orders" WHERE (("user_data"."id") = ("user_id"))) AS "_1_root.ar.root.orders.base" ) AS "_3_root.ar.root.orders"
+        ) as "user_orders"
+
+```
+
+ */
+
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+struct WhereClause {
+    left_path: Option<String>,
+    left_column: String,
+    expr: String,
+}
+
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Copy)]
+enum ReturnType {
+    Object,
+    Array,
+}
+
 impl TableSelection {
     fn to_simple_sql(&self) -> String {
-        format!(
-            "select {} from {}",
-            self.column_names.join(","),
-            self.table_name
-        )
+        let where_clause = self
+            .where_clauses
+            .iter()
+            .map(
+                |WhereClause {
+                     left_path,
+                     left_column,
+                     expr,
+                 }| {
+                    let path_string = left_path.to_owned().map_or("".to_string(), |path| {
+                        format!(r#""{}_data"."#, path).to_string()
+                    });
+                    format!(r#"{}"{}" = "{}""#, path_string, left_column, expr)
+                },
+            )
+            .join(" AND ");
+
+        let where_string = if !where_clause.is_empty() {
+            format!("where {}", where_clause)
+        } else {
+            "".to_string()
+        };
+
+        format!("select * from {} {}", self.table_name, where_string)
     }
 
     /*
@@ -483,29 +434,73 @@ impl TableSelection {
     ```
      */
 
-    fn to_json_sql(&self) -> String {
-        let data_id = "hehe".to_string();
-        let data_select = self.to_simple_sql();
-        let column_lines = self
+    // Shared for both
+    fn to_json_obj(&self) -> String {
+        let cols = self
             .column_names
             .iter()
-            .map(|col_name| {
-                format!(r#"select "{}"."{}" as "{}" "#, data_id, col_name, col_name).to_string()
+            .map(|col_name| format!(r#""{}_data"."{}" as "{}""#, self.path, col_name, col_name));
+        let data_select = self.to_simple_sql();
+
+        let default = match self.return_type {
+            ReturnType::Object => "'null'",
+            ReturnType::Array => "'[]'",
+        };
+
+        let joins = self
+            .left_joins
+            .iter()
+            .map(|LeftJoin { right_table, .. }| {
+                let nested = right_table.to_json_obj();
+                format!(
+                    r#"
+            LEFT OUTER JOIN LATERAL (
+                {nested}
+            ) as "{path}" on ('true')
+            "#,
+                    nested = nested,
+                    path = right_table.path
+                )
             })
-            .join(",\n");
+            .join("\n");
+
+        let join_cols = self.left_joins.iter().map(|LeftJoin { right_table, .. }| {
+            format!(
+                r#""{path}"."{col_name}" as "{out_name}""#,
+                path = right_table.path,
+                col_name = right_table.field_name,
+                out_name = right_table.field_name
+            )
+        });
+
+        let all_cols = cols.chain(join_cols).collect_vec().join(",\n");
+        let selector = match self.return_type {
+            ReturnType::Object => {
+                format!(r#"(json_agg("{path}") -> 0)"#, path = self.path)
+            }
+            ReturnType::Array => {
+                format!(r#"(json_agg("{path}"))"#, path = self.path)
+            }
+        };
 
         format!(
             r#"
-         select row_to_json(
-            {column_lines}
-         )
-         from (
-           {data_select} as {data_id}
-         )
+        select coalesce({selector}, {default}) as "{field_name}" 
+        from (select row_to_json(
+                            (select "json_spec"
+                             from (select {cols}) as "json_spec")) as "{path}"
+              from ({data_select}) as "{path}_data"
+                {joins}
+
+        ) as "{path}"
         "#,
+            path = self.path,
+            default = default,
+            cols = all_cols,
             data_select = data_select,
-            data_id = data_id,
-            column_lines = column_lines
+            joins = joins,
+            field_name = self.field_name,
+            selector = selector
         )
     }
 }
@@ -520,7 +515,10 @@ fn inner(selection: &Selection) -> Field {
 
 enum SearchPlace {
     TopLevel,
-    Relationship,
+    Relationship {
+        relationship: Relationship2,
+        path: String,
+    },
 }
 
 fn field_to_table_selection(
@@ -528,14 +526,18 @@ fn field_to_table_selection(
     tables: &Vec<Table>,
     search_place: &SearchPlace,
     relationships: &Vec<TableRelationship>,
+    relationships2: &Vec<Relationship2>,
+    path: String,
 ) -> TableSelection {
     let table = match search_place {
         SearchPlace::TopLevel => tables.iter().find(|table| {
             table
                 .toplevel_ops
+                .iter()
+                .map(|op| &op.name)
                 .contains(&field.response_key().node.to_string())
         }),
-        SearchPlace::Relationship => relationships
+        SearchPlace::Relationship { .. } => relationships
             .iter()
             .find(|relationship| relationship.field_name.eq(&field.name.node.to_string()))
             .map(|rel| &rel.foreign_table),
@@ -564,39 +566,99 @@ fn field_to_table_selection(
         .iter()
         .map(|Positioned { node, .. }| inner(node))
         .filter(|field| field.selection_set.node.items.len() > 0)
-        .collect::<Vec<Field>>();
-
-    let selected_joins = joins
-        .iter()
         .map(|field| {
-            (
-                field_to_table_selection(field, tables, &SearchPlace::Relationship, relationships),
-                field,
-            )
-        })
-        .map(|(joined_table, field)| {
-            let join_relationship = relationships
+            // Is this correct?
+            // We find a relationship that has the correct field name and the current table as at least one of the
+            println!(
+                "table: {}. field: {}, relationsips: {:#?}",
+                table.name,
+                field.name.node.to_string(),
+                relationships2
+            );
+            let relationship = relationships2
                 .iter()
                 .find(|relationship| {
-                    relationship.table.name == table.name
-                        && relationship.foreign_table.name == joined_table.table_name
-                        && relationship.field_name == field.name.node.to_string()
+                    relationship.table_name.contains(&table.name)
+                        && relationship
+                            .field_name
+                            .contains(&field.name.node.to_string())
                 })
-                .expect("Unable to find relationship");
+                .expect("Unable to find relationship")
+                .to_owned();
+            (field, relationship)
+        })
+        .collect::<Vec<(Field, Relationship2)>>();
 
-            LeftJoin {
-                right_table: joined_table,
-                join_conditions: vec![JoinCondition {
-                    left_col: join_relationship.column.name.to_owned(),
-                    right_col: join_relationship.foreign_column.name.to_owned(),
-                }],
-            }
+    // I do know which joins have been selected
+    // I do know which table "this" field corresponds to
+    // I need to produce a left join
+    // - right table (get from recursive call)
+    // - left col (have that from relationship)
+    // - right col (have tha from relationship)
+    let selected_joins = joins
+        .iter()
+        .map(|(field, relationship)| {
+            let wut = relationship.to_owned();
+            let updated_path = format!("{}.{}", path, field.name.node);
+
+            (
+                field_to_table_selection(
+                    field,
+                    tables,
+                    &SearchPlace::Relationship {
+                        relationship: wut,
+                        path: path.to_owned(),
+                    },
+                    relationships,
+                    relationships2,
+                    updated_path,
+                ),
+                field,
+                relationship,
+            )
+        })
+        .map(|(joined_table, field, relationship)| LeftJoin {
+            right_table: joined_table,
+            join_conditions: vec![JoinCondition {
+                left_col: relationship.field_name.to_owned(),
+                right_col: relationship.target_column_name.to_owned(),
+            }],
         })
         .collect_vec();
+
+    let where_clauses = match search_place {
+        SearchPlace::TopLevel => {
+            vec![]
+        }
+        SearchPlace::Relationship { relationship, path } => {
+            vec![WhereClause {
+                left_path: Some(path.to_string()),
+                left_column: relationship.column_name.to_string(),
+                expr: relationship.target_column_name.to_string(),
+            }]
+        }
+    };
+
+    let return_type = match search_place {
+        SearchPlace::TopLevel => {
+            table
+                .toplevel_ops
+                .iter()
+                .find(|op| op.name.contains(&field.name.node.to_string()))
+                .expect("Unable to find top level ops")
+                .return_type
+        }
+        SearchPlace::Relationship { relationship, .. } => relationship.return_type,
+    };
+
     TableSelection {
         left_joins: selected_joins,
+        where_clauses,
         column_names: columns,
         table_name: table.name.to_owned(),
+        return_type,
+        field_name: field.name.node.to_string(),
+        path,
     }
 }
 
@@ -604,6 +666,7 @@ fn to_intermediate(
     query: &ExecutableDocument,
     tables: &Vec<Table>,
     relationships: &Vec<TableRelationship>,
+    relationships2: &Vec<Relationship2>,
 ) -> Vec<TableSelection> {
     let ops = query
         .operations
@@ -615,82 +678,14 @@ fn to_intermediate(
         .flat_map(|operation_definition| {
             operation_definition.selection_set.node.items.iter().map(
                 |Positioned { node, .. }| match node {
-                    Selection::Field(Positioned { node, .. }) => {
-                        let table = &tables
-                            .iter()
-                            .find(|table| {
-                                table
-                                    .toplevel_ops
-                                    .contains(&node.response_key().node.to_string())
-                            })
-                            .expect("No table matching top level ops");
-
-                        let columns: Vec<String> = node
-                            .selection_set
-                            .node
-                            .items
-                            .iter()
-                            .map(|Positioned { node, .. }| inner(node))
-                            .map(|f| f.response_key().node.to_string())
-                            .filter(|col_name| {
-                                table
-                                    .columns
-                                    .iter()
-                                    .chain(table.primary_keys.iter().map(|pk| &pk.0))
-                                    .find(|col| col.name.eq(col_name))
-                                    .is_some()
-                            })
-                            .collect();
-
-                        let joins = node
-                            .selection_set
-                            .node
-                            .items
-                            .iter()
-                            .map(|Positioned { node, .. }| inner(node))
-                            .filter(|field| field.selection_set.node.items.len() > 0)
-                            .map(|field| {
-                                (
-                                    field_to_table_selection(
-                                        &field,
-                                        tables,
-                                        &SearchPlace::Relationship,
-                                        relationships,
-                                    ),
-                                    field,
-                                )
-                            })
-                            .map(|(tableselection, field)| {
-                                let join_relationship = relationships
-                                    .iter()
-                                    .find(|relationship| {
-                                        relationship.table.name == table.name
-                                            && relationship.foreign_table.name
-                                                == tableselection.table_name
-                                            && relationship.field_name
-                                                == field.name.node.to_string()
-                                    })
-                                    .expect("Unable to find relationship");
-
-                                LeftJoin {
-                                    right_table: tableselection,
-                                    join_conditions: vec![JoinCondition {
-                                        right_col: join_relationship
-                                            .foreign_column
-                                            .name
-                                            .to_string(),
-                                        left_col: join_relationship.column.name.to_string(),
-                                    }],
-                                }
-                            })
-                            .collect_vec();
-
-                        TableSelection {
-                            table_name: table.name.to_string(),
-                            column_names: columns,
-                            left_joins: joins,
-                        }
-                    }
+                    Selection::Field(Positioned { node, .. }) => field_to_table_selection(
+                        &node,
+                        tables,
+                        &SearchPlace::TopLevel,
+                        relationships,
+                        relationships2,
+                        "root".to_string(),
+                    ),
                     Selection::FragmentSpread(_) => todo!(),
                     Selection::InlineFragment(_) => todo!(),
                 },
@@ -702,15 +697,14 @@ fn to_intermediate(
 #[cfg(test)]
 mod tests {
     use crate::{
-        to_intermediate, to_sql, JoinCondition, LeftJoin, Relationship, SearchPlace,
-        TableRelationship, TableSelection,
+        to_intermediate, JoinCondition, LeftJoin, Op, Relationship, Relationship2, ReturnType,
+        SearchPlace, TableRelationship, TableSelection, WhereClause,
     };
 
     use crate::Column;
     use crate::PrimaryKey;
     use crate::Table;
     use async_graphql::parser::parse_query;
-    use serde_json::to_string;
 
     fn single_table() -> Vec<Table> {
         vec![Table {
@@ -735,11 +729,14 @@ mod tests {
                 unique: true,
             })],
             name: "example".to_string(),
-            toplevel_ops: vec!["get_example_by_id".to_string()],
+            toplevel_ops: vec![Op {
+                name: "get_example_by_id".to_string(),
+                return_type: ReturnType::Object,
+            }],
         }]
     }
 
-    fn two_tables() -> (Vec<Table>, Vec<TableRelationship>) {
+    fn two_tables() -> (Vec<Table>, Vec<TableRelationship>, Vec<Relationship2>) {
         let author_col = Column {
             name: "author".to_string(),
             datatype: "uuid".to_string(),
@@ -771,7 +768,10 @@ mod tests {
                     unique: true,
                 })],
                 name: "posts".to_string(),
-                toplevel_ops: vec!["get_post_by_id".to_string()],
+                toplevel_ops: vec![Op {
+                    name: "get_post_by_id".to_string(),
+                    return_type: ReturnType::Object,
+                }],
             },
             Table {
                 columns: vec![
@@ -790,20 +790,44 @@ mod tests {
                 ],
                 primary_keys: vec![PrimaryKey(user_id_column.to_owned())],
                 name: "users".to_string(),
-                toplevel_ops: vec!["get_user_by_id".to_string()],
+                toplevel_ops: vec![Op {
+                    name: "get_user_by_id".to_string(),
+                    return_type: ReturnType::Object,
+                }],
             },
         ];
 
         let relationships = vec![TableRelationship {
             table: tables.first().unwrap().to_owned(),
-            column: author_col,
+            column: author_col.to_owned(),
             foreign_table: tables.last().unwrap().to_owned(),
             foreign_column: user_id_column.to_owned(),
             constraint_name: "".to_string(),
             field_name: "user".to_string(),
         }];
 
-        (tables, relationships)
+        let relationships2 = vec![
+            Relationship2 {
+                table_name: "posts".to_string(),
+                column_name: author_col.name.to_owned(),
+                target_table_name: "users".to_string(),
+                target_column_name: user_id_column.name.to_string(),
+                field_name: "users".to_string(),
+                return_type: ReturnType::Object,
+                column_optional: false,
+            },
+            Relationship2 {
+                table_name: "users".to_string(),
+                column_name: user_id_column.name.to_string(),
+                target_table_name: "posts".to_string(),
+                target_column_name: author_col.name.to_string(),
+                field_name: "posts".to_string(),
+                return_type: ReturnType::Array,
+                column_optional: false,
+            },
+        ];
+
+        (tables, relationships, relationships2)
     }
 
     #[test]
@@ -820,12 +844,17 @@ mod tests {
 
         let parsed_query = parse_query(query).unwrap();
 
-        let intermediate = to_intermediate(&parsed_query, &single_table(), &vec![]);
+        let intermediate = to_intermediate(&parsed_query, &single_table(), &vec![], &vec![]);
 
         let expected = vec![TableSelection {
             table_name: "example".to_string(),
             column_names: vec!["id".to_string(), "number".to_string()],
             left_joins: vec![],
+
+            where_clauses: vec![],
+            return_type: ReturnType::Object,
+            field_name: "get_example_by_id".to_string(),
+            path: "root".to_string(),
         }];
 
         println!("{:#?}", intermediate);
@@ -849,8 +878,8 @@ mod tests {
         "#;
 
         let parsed_query = parse_query(query).unwrap();
-        let (tables, relationships) = two_tables();
-        let intermediate = to_intermediate(&parsed_query, &tables, &relationships);
+        let (tables, relationships, relationships2) = two_tables();
+        let intermediate = to_intermediate(&parsed_query, &tables, &relationships, &relationships2);
 
         let expected = vec![TableSelection {
             table_name: "posts".to_string(),
@@ -860,14 +889,107 @@ mod tests {
                     table_name: "users".to_string(),
                     column_names: vec!["id".to_string(), "name".to_string()],
                     left_joins: vec![],
+                    where_clauses: vec![{
+                        WhereClause {
+                            left_path: Some("root".to_string()),
+                            left_column: "author".to_string(),
+                            expr: "id".to_string(),
+                        }
+                    }],
+                    return_type: ReturnType::Object,
+                    field_name: "user".to_string(),
+
+                    path: "root.user".to_string(),
                 },
                 join_conditions: vec![JoinCondition {
-                    left_col: "author".to_string(),
+                    left_col: "users".to_string(),
                     right_col: "id".to_string(),
                 }],
             }],
+            where_clauses: vec![],
+            return_type: ReturnType::Object,
+            field_name: "get_post_by_id".to_string(),
+            path: "root".to_string(),
         }];
 
         assert_eq!(intermediate, expected);
+    }
+
+    #[test]
+    fn join_sql() {
+        let intermediate = TableSelection {
+            table_name: "posts".to_string(),
+            column_names: vec!["id".to_string(), "content".to_string()],
+            left_joins: vec![LeftJoin {
+                right_table: TableSelection {
+                    table_name: "users".to_string(),
+                    column_names: vec!["id".to_string(), "name".to_string()],
+                    left_joins: vec![],
+                    where_clauses: vec![{
+                        WhereClause {
+                            left_path: Some("root".to_string()),
+                            left_column: "author".to_string(),
+                            expr: "id".to_string(),
+                        }
+                    }],
+                    return_type: ReturnType::Object,
+                    field_name: "user".to_string(),
+
+                    path: "root.user".to_string(),
+                },
+                join_conditions: vec![JoinCondition {
+                    left_col: "users".to_string(),
+                    right_col: "id".to_string(),
+                }],
+            }],
+            where_clauses: vec![WhereClause {
+                left_path: None,
+                left_column: "id".to_string(),
+                expr: "04510aac-ad26-48ee-b081-47ce2f5ee3f2".to_string(),
+            }],
+            return_type: ReturnType::Object,
+            field_name: "get_post_by_id".to_string(),
+            path: "root".to_string(),
+        };
+
+        let sql = intermediate.to_json_obj();
+
+        let expected = r#"
+        select coalesce(json_agg("root", 'null') as "root"
+        from (
+            select row_to_json(
+                select "json_spec"
+                from (
+                    select "get_post_by_id"."id" as"id" ,
+select "get_post_by_id"."content" as"content"
+                ) as "json_spec"
+            )
+            from (
+                select id,content from posts where  as "root"
+                
+            LEFT OUTER JOIN LATERAL (
+
+        select coalesce(json_agg("root.user", 'null') as "root.user"
+        from (
+            select row_to_json(
+                select "json_spec"
+                from (
+                    select "user"."id" as"id" ,
+select "user"."name" as"name"
+                ) as "json_spec"
+            )
+            from (
+                select id,name from users where "author" = id as "root.user"
+
+            )
+        ) as "root.user"
+
+            ) as user on ('true')
+
+            )
+        ) as "root""#;
+
+        println!("{}", sql);
+        println!("{}", expected);
     }
 }
