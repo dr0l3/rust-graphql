@@ -252,132 +252,6 @@ struct JoinCondition {
     right_col: String,
 }
 
-#[derive(Debug)]
-struct DataId {
-    horizontal: usize,
-    vertical: usize,
-}
-
-impl Display for DataId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}{}", self.horizontal, self.vertical)
-    }
-}
-
-impl DataId {
-    fn next_horizontal(&self) -> DataId {
-        DataId {
-            horizontal: self.horizontal + 1,
-            vertical: self.vertical,
-        }
-    }
-
-    fn next_vertical(&self) -> DataId {
-        DataId {
-            horizontal: self.horizontal,
-            vertical: self.vertical + 1,
-        }
-    }
-
-    fn advanced_vertical(&self, n: usize) -> DataId {
-        DataId {
-            horizontal: self.horizontal,
-            vertical: self.vertical + n,
-        }
-    }
-
-    fn advanced_horizontal(&self, n: usize) -> DataId {
-        DataId {
-            horizontal: self.horizontal + n,
-            vertical: self.vertical,
-        }
-    }
-
-    fn to_id(&self) -> String {
-        String::from(format!("{}{}", self.horizontal, self.vertical))
-    }
-}
-
-/*
-
-The cases
-
-# Return type
-## Object
-
-
-```sql
-SELECT coalesce((json_agg("root") -> 0), 'null') AS "root"
-from
-    select row_to_json(
-        (
-            select "json_spec"
-            from (
-                select
-                    "user_data"."id" as "id",
-                    "user_data"."email" as "email",
-                    "user_data"."birthday" as "birthday"
-                ) as "json_spec")) as "root"
-    from (select * from users where id 'some-uuid') as "user_data"
-```
-
-## List/Array
-
-```sql
-select coalesce(json_agg("root"), '[]') as "root"
-from
-    select row_to_json(
-        (
-            select "json_spec"
-            from (
-                select
-                    "user_data"."id" as "id",
-                    "user_data"."email" as "email",
-                    "user_data"."birthday" as "birthday"
-                ) as "json_spec")) as "root"
-    from (select * from users) as "user_data"
-```
-
-# JOin structure
-
-## Object
-```sql
-SELECT coalesce((json_agg("root") -> 0), 'null') AS "root"
-from
-    select row_to_json(
-        (
-            select "json_spec"
-            from (
-                select
-                    "user_data"."id" as "id",
-                    "user_data"."email" as "email",
-                    "user_data"."birthday" as "birthday",
-                    "user_orders"."orders" as "orders"
-                ) as "json_spec")) as "root"
-    from
-        (select * from users where id 'some-uuid') as "user_data"
-        left outer join lateral (
-            SELECT
-                    coalesce(json_agg("orders"), '[]') AS "orders"
-            FROM
-                (
-                    SELECT row_to_json(
-                            (
-                                SELECT
-                                    "json_spec"
-                                FROM (
-                                    SELECT
-                                            "order_data"."id" AS "id",
-                                            "order_data"."time" AS "time"
-                                    ) AS "json_spec")) AS "orders"
-                        FROM
-                            (SELECT * FROM "public"."orders" WHERE (("user_data"."id") = ("user_id"))) AS "_1_root.ar.root.orders.base" ) AS "_3_root.ar.root.orders"
-        ) as "user_orders"
-
-```
-
- */
-
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 struct WhereClause {
     left_path: Option<String>,
@@ -392,7 +266,7 @@ enum ReturnType {
 }
 
 impl TableSelection {
-    fn to_simple_sql(&self) -> String {
+    fn to_data_select_sql(&self) -> String {
         let where_clause = self
             .where_clauses
             .iter()
@@ -435,12 +309,12 @@ impl TableSelection {
      */
 
     // Shared for both
-    fn to_json_obj(&self) -> String {
+    fn to_json_sql(&self) -> String {
         let cols = self
             .column_names
             .iter()
             .map(|col_name| format!(r#""{}_data"."{}" as "{}""#, self.path, col_name, col_name));
-        let data_select = self.to_simple_sql();
+        let data_select = self.to_data_select_sql();
 
         let default = match self.return_type {
             ReturnType::Object => "'null'",
@@ -451,7 +325,7 @@ impl TableSelection {
             .left_joins
             .iter()
             .map(|LeftJoin { right_table, .. }| {
-                let nested = right_table.to_json_obj();
+                let nested = right_table.to_json_sql();
                 format!(
                     r#"
             LEFT OUTER JOIN LATERAL (
@@ -525,7 +399,6 @@ fn field_to_table_selection(
     field: &Field,
     tables: &Vec<Table>,
     search_place: &SearchPlace,
-    relationships: &Vec<TableRelationship>,
     relationships2: &Vec<Relationship2>,
     path: String,
 ) -> TableSelection {
@@ -537,10 +410,9 @@ fn field_to_table_selection(
                 .map(|op| &op.name)
                 .contains(&field.response_key().node.to_string())
         }),
-        SearchPlace::Relationship { .. } => relationships
+        SearchPlace::Relationship { relationship, .. } => tables
             .iter()
-            .find(|relationship| relationship.field_name.eq(&field.name.node.to_string()))
-            .map(|rel| &rel.foreign_table),
+            .find(|table| table.name.contains(&relationship.target_table_name)),
     }
     .expect("No table found");
 
@@ -567,14 +439,6 @@ fn field_to_table_selection(
         .map(|Positioned { node, .. }| inner(node))
         .filter(|field| field.selection_set.node.items.len() > 0)
         .map(|field| {
-            // Is this correct?
-            // We find a relationship that has the correct field name and the current table as at least one of the
-            println!(
-                "table: {}. field: {}, relationsips: {:#?}",
-                table.name,
-                field.name.node.to_string(),
-                relationships2
-            );
             let relationship = relationships2
                 .iter()
                 .find(|relationship| {
@@ -598,7 +462,7 @@ fn field_to_table_selection(
     let selected_joins = joins
         .iter()
         .map(|(field, relationship)| {
-            let wut = relationship.to_owned();
+            let relationship_param = relationship.to_owned();
             let updated_path = format!("{}.{}", path, field.name.node);
 
             (
@@ -606,18 +470,16 @@ fn field_to_table_selection(
                     field,
                     tables,
                     &SearchPlace::Relationship {
-                        relationship: wut,
+                        relationship: relationship_param,
                         path: path.to_owned(),
                     },
-                    relationships,
                     relationships2,
                     updated_path,
                 ),
-                field,
                 relationship,
             )
         })
-        .map(|(joined_table, field, relationship)| LeftJoin {
+        .map(|(joined_table, relationship)| LeftJoin {
             right_table: joined_table,
             join_conditions: vec![JoinCondition {
                 left_col: relationship.field_name.to_owned(),
@@ -665,7 +527,6 @@ fn field_to_table_selection(
 fn to_intermediate(
     query: &ExecutableDocument,
     tables: &Vec<Table>,
-    relationships: &Vec<TableRelationship>,
     relationships2: &Vec<Relationship2>,
 ) -> Vec<TableSelection> {
     let ops = query
@@ -682,7 +543,6 @@ fn to_intermediate(
                         &node,
                         tables,
                         &SearchPlace::TopLevel,
-                        relationships,
                         relationships2,
                         "root".to_string(),
                     ),
@@ -736,7 +596,7 @@ mod tests {
         }]
     }
 
-    fn two_tables() -> (Vec<Table>, Vec<TableRelationship>, Vec<Relationship2>) {
+    fn two_tables() -> (Vec<Table>, Vec<Relationship2>) {
         let author_col = Column {
             name: "author".to_string(),
             datatype: "uuid".to_string(),
@@ -797,15 +657,6 @@ mod tests {
             },
         ];
 
-        let relationships = vec![TableRelationship {
-            table: tables.first().unwrap().to_owned(),
-            column: author_col.to_owned(),
-            foreign_table: tables.last().unwrap().to_owned(),
-            foreign_column: user_id_column.to_owned(),
-            constraint_name: "".to_string(),
-            field_name: "user".to_string(),
-        }];
-
         let relationships2 = vec![
             Relationship2 {
                 table_name: "posts".to_string(),
@@ -827,7 +678,7 @@ mod tests {
             },
         ];
 
-        (tables, relationships, relationships2)
+        (tables, relationships2)
     }
 
     #[test]
@@ -844,7 +695,7 @@ mod tests {
 
         let parsed_query = parse_query(query).unwrap();
 
-        let intermediate = to_intermediate(&parsed_query, &single_table(), &vec![], &vec![]);
+        let intermediate = to_intermediate(&parsed_query, &single_table(), &vec![]);
 
         let expected = vec![TableSelection {
             table_name: "example".to_string(),
@@ -878,8 +729,8 @@ mod tests {
         "#;
 
         let parsed_query = parse_query(query).unwrap();
-        let (tables, relationships, relationships2) = two_tables();
-        let intermediate = to_intermediate(&parsed_query, &tables, &relationships, &relationships2);
+        let (tables, relationships2) = two_tables();
+        let intermediate = to_intermediate(&parsed_query, &tables, &relationships2);
 
         let expected = vec![TableSelection {
             table_name: "posts".to_string(),
@@ -952,7 +803,7 @@ mod tests {
             path: "root".to_string(),
         };
 
-        let sql = intermediate.to_json_obj();
+        let sql = intermediate.to_json_sql();
 
         let expected = r#"
         select coalesce(json_agg("root", 'null') as "root"
