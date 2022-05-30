@@ -43,11 +43,11 @@ pub fn convert_introspect_data(
                 table,
                 columns
                     .iter()
-                    .filter(|col| col.table_name.contains(&table.name))
+                    .filter(|col| col.table_name.eq(&table.name))
                     .collect_vec(),
                 constraints
                     .iter()
-                    .filter(|constraint| constraint.table_name.contains(&table.name))
+                    .filter(|constraint| constraint.table_name.eq(&table.name))
                     .collect_vec(),
             )
         })
@@ -134,43 +134,6 @@ pub fn convert_introspect_data(
                     .map(|col| PrimaryKey(col.to_owned().to_owned()))
                     .collect_vec(),
                 toplevel_ops,
-            }
-        })
-        .collect_vec();
-
-    let relationships = references
-        .iter()
-        .map(|reference| {
-            let table = tables
-                .iter()
-                .find(|table| table.name.contains(&reference.table_name))
-                .expect("Unable to find table")
-                .to_owned();
-            let column = table
-                .get_all_columns()
-                .find(|col| col.name.contains(&reference.column_name))
-                .expect("Unable to find column")
-                .to_owned();
-            let foreign_table = tables
-                .iter()
-                .find(|table| table.name.contains(&reference.foreign_table_name))
-                .expect("Unable to find foreign table")
-                .to_owned();
-            let foreign_column = foreign_table
-                .get_all_columns()
-                .find(|col| col.name.contains(&reference.foreign_column_name))
-                .expect("Unable to find column")
-                .to_owned();
-
-            let field_name = format!("{}", table.name); // TODO: Better
-
-            TableRelationship {
-                table,
-                column,
-                foreign_table,
-                foreign_column,
-                constraint_name: "wut?".to_string(), //TODO: Fix this
-                field_name,
             }
         })
         .collect_vec();

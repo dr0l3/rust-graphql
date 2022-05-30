@@ -911,10 +911,17 @@ from
             .map(|init_sql| sqlx::query(init_sql).execute(&pool))
             .collect_vec();
 
-        let _ = try_join_all(init).await?;
+        for future in init {
+            future.await?;
+        }
+
+        //let init_res = try_join_all(init).await?;
+        //println!("{:#?}", init_res);
 
         let (tables, constraints, cols, references) = fetch_introspection_data(&pool).await?;
         let introspection = convert_introspect_data(tables, constraints, cols, references);
+
+        println!("{:#?}", introspection);
         let query = parse_query(query).unwrap();
         let intermediate =
             to_intermediate(&query, &introspection.tables, &introspection.relationships2);
@@ -956,6 +963,62 @@ from
 
         let actual = base_test(init_sql, graphql_query).await?;
         let expected = serde_json::json!({"a": 1, "b": "rune"});
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    async fn simple_table_subset_select() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text)"),
+            String::from("insert into test values(1, 'rune')"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                get_test_by_id(a: 1) {
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!({"b": "rune"});
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_docker() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text);"),
+            String::from("insert into test values(1, 'rune');"),
+            String::from("create table test2(c int primary key, d int references test(a));"),
+            String::from("insert into test2 values(1, 1);"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                get_test2_by_id(c: 1) {
+                    c
+                    d
+                    test {
+                        a
+                        b
+                    }
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!({"c": 1, "d": 1,"test":{"a": 1, "b": "rune"}});
 
         assert_eq!(expected, actual);
 
