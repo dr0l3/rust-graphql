@@ -16,6 +16,10 @@ sqlx = {version = "0.5", features = ["runtime-tokio-native-tls", "postgres"]}
 tokio = {version = "1", features = ["full"]}
 uuid = {version = "1.0.0", features = ["v4", "fast-rng"]}
 itertools = "0.10.3"
+sqlformat = "0.2.0"
+dockertest = "0.3.0"
+testcontainers = "0.13.0"
+derivative = "2.2.0"
 
 [toolchain]
 channel = "nightly"

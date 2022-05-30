@@ -1,15 +1,15 @@
+use crate::InputType::{GraphQLID, GraphQLInteger, GraphQLString};
 use crate::{
-    ok, Column, Op, PrimaryKey, Relationship2, ReturnType, Table, TableColumm, TableReferences,
-    TableRelationship, TableRow, TableUniqueConstraint, TableView,
+    ok, Arg, Column, Op, PrimaryKey, Relationship2, ReturnType, Table, TableColumm,
+    TableReferences, TableRelationship, TableRow, TableUniqueConstraint, TableView,
 };
 use itertools::Itertools;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 
 #[derive(Debug, Clone)]
 pub struct IntrospectionResult {
-    tables: Vec<Table>,
-    relationships: Vec<TableRelationship>,
-    relationships2: Vec<Relationship2>,
+    pub tables: Vec<Table>,
+    pub relationships2: Vec<Relationship2>,
 }
 
 pub async fn fetch_introspection_data(
@@ -35,7 +35,7 @@ pub fn convert_introspect_data(
     constraints: Vec<TableConstraint>,
     columns: Vec<TableColumm>,
     references: Vec<TableReferences>,
-) -> Result<IntrospectionResult, ()> {
+) -> IntrospectionResult {
     let introspection_results = pg_tables
         .iter()
         .map(|table| {
@@ -104,6 +104,23 @@ pub fn convert_introspect_data(
                 vec![Op {
                     name: format!("get_{}_by_id", table.name),
                     return_type: ReturnType::Object,
+                    args: primary_keys
+                        .iter()
+                        .map(|pk| {
+                            println!("{:?}", pk);
+
+                            Arg {
+                                name: pk.name.to_owned(),
+                                tpe: match pk.datatype.as_str() {
+                                    "text" => GraphQLString,
+                                    "int" => GraphQLInteger,
+                                    "integer" => GraphQLInteger,
+                                    "uuid" => GraphQLID,
+                                    _ => GraphQLString,
+                                },
+                            }
+                        })
+                        .collect_vec(),
                 }]
             } else {
                 vec![]
@@ -218,11 +235,10 @@ pub fn convert_introspect_data(
         })
         .collect_vec();
 
-    Ok(IntrospectionResult {
+    IntrospectionResult {
         tables,
-        relationships,
         relationships2,
-    })
+    }
 }
 
 async fn get_tables(pool: &Pool<Postgres>) -> Result<Vec<TableRow>, sqlx::Error> {

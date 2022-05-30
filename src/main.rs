@@ -5,32 +5,42 @@ extern crate dotenv;
 use async_graphql::{
     parser::parse_query,
     parser::types::{ExecutableDocument, Field, OperationDefinition, Selection},
-    registry::MetaField,
     *,
 };
-use dotenv::dotenv;
 use futures::future::*;
 use itertools::Itertools;
 use postgres_introspect::{convert_introspect_data, fetch_introspection_data};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
-use std::borrow::Borrow;
-use std::env;
 use std::fmt::{format, Display, Formatter};
-use std::ops::Add;
-use uuid::*;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
-struct Table {
-    name: String,
-    columns: Vec<Column>,
-    primary_keys: Vec<PrimaryKey>,
-    toplevel_ops: Vec<Op>,
+pub struct Table {
+    pub name: String,
+    pub columns: Vec<Column>,
+    pub primary_keys: Vec<PrimaryKey>,
+    pub toplevel_ops: Vec<Op>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Op {
+    pub name: String,
+    pub return_type: ReturnType,
+    pub args: Vec<Arg>,
+}
+
+#[derive(Debug, Clone)]
+pub enum InputType {
+    GraphQLInteger,
+    GraphQLString,
+    GraphQLBoolean,
+    GraphQLID,
+}
+
+#[derive(Debug, Clone)]
+pub struct Arg {
     name: String,
-    return_type: ReturnType,
+    tpe: InputType,
 }
 
 impl Table {
@@ -42,45 +52,15 @@ impl Table {
 }
 
 #[derive(Debug, Clone)]
-struct Column {
-    name: String,
-    datatype: String,
-    required: bool,
-    unique: bool,
+pub struct Column {
+    pub name: String,
+    pub datatype: String,
+    pub required: bool,
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone)]
-struct PrimaryKey(Column);
-
-struct TableName(String);
-
-struct ColumnName(String);
-
-struct RelationshipName(String);
-
-enum Relationship {
-    OneToOne {
-        table_name: String,
-        column_name: String,
-        foreign_table_name: String,
-        foreign_column_name: String,
-        relationship_name: String,
-    },
-    OneToMany {
-        table_name: String,
-        column_name: String,
-        foreign_table_name: String,
-        foreign_column_name: String,
-        relationship_name: String,
-    },
-    ManyToOne {
-        foreign_table_name: String,
-        foreign_column_name: String,
-        relationship_name: String,
-        table_name: String,
-        column_name: String,
-    },
-}
+pub struct PrimaryKey(Column);
 
 // cases
 // - column is optional -> GraphQL type is wrapped optional
@@ -110,22 +90,6 @@ struct TableRelationship {
     field_name: String,
     //table_to_foreign_field_name
     //foreign_to
-}
-
-impl Relationship {
-    fn get_relationship_name(&self) -> String {
-        match self {
-            Relationship::OneToOne {
-                relationship_name, ..
-            } => relationship_name.to_string(),
-            Relationship::OneToMany {
-                relationship_name, ..
-            } => relationship_name.to_string(),
-            Relationship::ManyToOne {
-                relationship_name, ..
-            } => relationship_name.to_string(),
-        }
-    }
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
@@ -171,48 +135,8 @@ struct TableUniqueConstraint {
     column_name: String,
 }
 
-fn test_something() -> Result<(), String> {
-    let wut = parse_query(
-        std::fs::read_to_string("./example_getby_id.graphql").map_err(|err| err.to_string())?,
-    )
-    .map_err(|err| err.to_string())?;
-
-    println!("{:#?}", wut);
-
-    let tables = vec![Table {
-        columns: vec![
-            Column {
-                name: "number".to_string(),
-                datatype: "integer".to_string(),
-                required: false,
-                unique: false,
-            },
-            Column {
-                name: "txt".to_string(),
-                datatype: "text".to_string(),
-                required: false,
-                unique: false,
-            },
-        ],
-        primary_keys: vec![PrimaryKey(Column {
-            name: "id".to_string(),
-            datatype: "uuid".to_string(),
-            required: true,
-            unique: true,
-        })],
-        name: "example".to_string(),
-        toplevel_ops: vec![Op {
-            name: "get_example_by_id".to_string(),
-            return_type: ReturnType::Object,
-        }],
-    }];
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    //test_something();
-
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect("postgres://postgres:postgres@0.0.0.0:5439/dixa")
@@ -221,8 +145,7 @@ async fn main() -> Result<(), String> {
     let (tables, constraints, columns, references) = fetch_introspection_data(&pool)
         .map_err(|err| err.to_string())
         .await?;
-    let results =
-        convert_introspect_data(tables, constraints, columns, references).map_err(|err| "Wut")?;
+    let results = convert_introspect_data(tables, constraints, columns, references);
 
     println!("{:#?}", results);
 
@@ -260,7 +183,7 @@ struct WhereClause {
 }
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Copy)]
-enum ReturnType {
+pub enum ReturnType {
     Object,
     Array,
 }
@@ -279,7 +202,7 @@ impl TableSelection {
                     let path_string = left_path.to_owned().map_or("".to_string(), |path| {
                         format!(r#""{}_data"."#, path).to_string()
                     });
-                    format!(r#"{}"{}" = "{}""#, path_string, left_column, expr)
+                    format!(r#"{}"{}" = {}"#, path_string, left_column, expr)
                 },
             )
             .join(" AND ");
@@ -424,6 +347,7 @@ fn field_to_table_selection(
         .map(|Positioned { node, .. }| inner(node))
         .map(|f| f.response_key().node.to_string())
         .filter(|col_name| {
+            //TODO: Should probably explode instead of silently ignoring fields
             table
                 .get_all_columns()
                 .find(|col| col.name.eq(col_name))
@@ -490,13 +414,45 @@ fn field_to_table_selection(
 
     let where_clauses = match search_place {
         SearchPlace::TopLevel => {
-            vec![]
+            let op = table
+                .toplevel_ops
+                .iter()
+                .find(|op| op.name.eq(&field.name.node))
+                .unwrap();
+
+            op.args
+                .iter()
+                .map(|op_arg| {
+                    let (_, field_arg_value) = field
+                        .arguments
+                        .iter()
+                        .find(|(field_arg, _)| op_arg.name.eq(&field_arg.node))
+                        .unwrap();
+
+                    println!("{:?}", op_arg);
+
+                    WhereClause {
+                        left_path: None,
+                        left_column: op_arg.name.to_owned(),
+                        expr: match op_arg.tpe {
+                            InputType::GraphQLInteger => field_arg_value.node.to_string(),
+                            InputType::GraphQLString => {
+                                format!(r#"{}"#, field_arg_value.node.to_string())
+                            }
+                            InputType::GraphQLBoolean => field_arg_value.node.to_string(),
+                            InputType::GraphQLID => {
+                                format!(r#"{}"#, field_arg_value.node.to_string())
+                            }
+                        },
+                    }
+                })
+                .collect_vec()
         }
         SearchPlace::Relationship { relationship, path } => {
             vec![WhereClause {
                 left_path: Some(path.to_string()),
                 left_column: relationship.column_name.to_string(),
-                expr: relationship.target_column_name.to_string(),
+                expr: format!(r#""{}""#, relationship.target_column_name.to_string()),
             }]
         }
     };
@@ -557,14 +513,28 @@ fn to_intermediate(
 #[cfg(test)]
 mod tests {
     use crate::{
-        to_intermediate, JoinCondition, LeftJoin, Op, Relationship, Relationship2, ReturnType,
-        SearchPlace, TableRelationship, TableSelection, WhereClause,
+        convert_introspect_data, fetch_introspection_data, select, to_intermediate, Arg, InputType,
+        JoinCondition, LeftJoin, Op, Relationship2, ReturnType, SearchPlace, TableRelationship,
+        TableSelection, TryFutureExt, WhereClause,
     };
+    use derivative::*;
+    use futures::future::{join_all, try_join_all};
+    use futures::{join, select, try_join};
+    use sqlformat::{format, FormatOptions, QueryParams};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use testcontainers::*;
 
     use crate::Column;
     use crate::PrimaryKey;
     use crate::Table;
     use async_graphql::parser::parse_query;
+    use dockertest::waitfor::{MessageSource, MessageWait};
+    use dockertest::{Composition, DockerTest, Source};
+    use itertools::Itertools;
+    use sqlx::query::Query;
+    use sqlx::{postgres::PgPoolOptions, Error, Pool, Postgres, Row};
+    use testcontainers::core::WaitFor;
 
     fn single_table() -> Vec<Table> {
         vec![Table {
@@ -592,6 +562,10 @@ mod tests {
             toplevel_ops: vec![Op {
                 name: "get_example_by_id".to_string(),
                 return_type: ReturnType::Object,
+                args: vec![Arg {
+                    name: "id".to_string(),
+                    tpe: InputType::GraphQLID,
+                }],
             }],
         }]
     }
@@ -631,6 +605,10 @@ mod tests {
                 toplevel_ops: vec![Op {
                     name: "get_post_by_id".to_string(),
                     return_type: ReturnType::Object,
+                    args: vec![Arg {
+                        name: "id".to_string(),
+                        tpe: InputType::GraphQLID,
+                    }],
                 }],
             },
             Table {
@@ -653,6 +631,10 @@ mod tests {
                 toplevel_ops: vec![Op {
                     name: "get_user_by_id".to_string(),
                     return_type: ReturnType::Object,
+                    args: vec![Arg {
+                        name: "id".to_string(),
+                        tpe: InputType::GraphQLID,
+                    }],
                 }],
             },
         ];
@@ -684,8 +666,8 @@ mod tests {
     #[test]
     fn simple_table_not_all_columns_json() {
         let query = r#"
-        query get_example($id: Uuid!) {
-            get_example_by_id(id: $id) {
+        query get_example {
+            get_example_by_id(id: "hello") {
               id
               number
             }
@@ -702,7 +684,11 @@ mod tests {
             column_names: vec!["id".to_string(), "number".to_string()],
             left_joins: vec![],
 
-            where_clauses: vec![],
+            where_clauses: vec![WhereClause {
+                left_path: None,
+                left_column: "id".to_string(),
+                expr: r#""hello""#.to_string(),
+            }],
             return_type: ReturnType::Object,
             field_name: "get_example_by_id".to_string(),
             path: "root".to_string(),
@@ -716,8 +702,8 @@ mod tests {
     #[test]
     fn join_table_json() {
         let query = r#"
-        query get_post_with_user($id: Uuid!) {
-            get_post_by_id(id: $id) {
+        query get_post_with_user {
+            get_post_by_id(id: "hello") {
                 id
                 content
                 user {
@@ -744,7 +730,7 @@ mod tests {
                         WhereClause {
                             left_path: Some("root".to_string()),
                             left_column: "author".to_string(),
-                            expr: "id".to_string(),
+                            expr: r#""id""#.to_string(),
                         }
                     }],
                     return_type: ReturnType::Object,
@@ -757,7 +743,11 @@ mod tests {
                     right_col: "id".to_string(),
                 }],
             }],
-            where_clauses: vec![],
+            where_clauses: vec![WhereClause {
+                left_path: None,
+                left_column: "id".to_string(),
+                expr: r#""hello""#.to_string(),
+            }],
             return_type: ReturnType::Object,
             field_name: "get_post_by_id".to_string(),
             path: "root".to_string(),
@@ -780,7 +770,7 @@ mod tests {
                         WhereClause {
                             left_path: Some("root".to_string()),
                             left_column: "author".to_string(),
-                            expr: "id".to_string(),
+                            expr: r#""id""#.to_string(),
                         }
                     }],
                     return_type: ReturnType::Object,
@@ -796,7 +786,7 @@ mod tests {
             where_clauses: vec![WhereClause {
                 left_path: None,
                 left_column: "id".to_string(),
-                expr: "04510aac-ad26-48ee-b081-47ce2f5ee3f2".to_string(),
+                expr: r#""04510aac-ad26-48ee-b081-47ce2f5ee3f2""#.to_string(),
             }],
             return_type: ReturnType::Object,
             field_name: "get_post_by_id".to_string(),
@@ -805,42 +795,170 @@ mod tests {
 
         let sql = intermediate.to_json_sql();
 
-        let expected = r#"
-        select coalesce(json_agg("root", 'null') as "root"
-        from (
-            select row_to_json(
-                select "json_spec"
-                from (
-                    select "get_post_by_id"."id" as"id" ,
-select "get_post_by_id"."content" as"content"
-                ) as "json_spec"
-            )
-            from (
-                select id,content from posts where  as "root"
-                
-            LEFT OUTER JOIN LATERAL (
+        let expected = r#"select
+  coalesce((json_agg("root") -> 0), 'null') as "get_post_by_id"
+from
+  (
+    select
+      row_to_json(
+        (
+          select
+            "json_spec"
+          from
+            (
+              select
+                "root_data"."id" as "id",
+                "root_data"."content" as "content",
+                "root.user"."user" as "user"
+            ) as "json_spec"
+        )
+      ) as "root"
+    from
+      (
+        select
+          *
+        from
+          posts
+        where
+          "id" = "04510aac-ad26-48ee-b081-47ce2f5ee3f2"
+      ) as "root_data"
+      LEFT OUTER JOIN LATERAL (
+        select
+          coalesce((json_agg("root.user") -> 0), 'null') as "user"
+        from
+          (
+            select
+              row_to_json(
+                (
+                  select
+                    "json_spec"
+                  from
+                    (
+                      select
+                        "root.user_data"."id" as "id",
+                        "root.user_data"."name" as "name"
+                    ) as "json_spec"
+                )
+              ) as "root.user"
+            from
+              (
+                select
+                  *
+                from
+                  users
+                where
+                  "root_data"."author" = "id"
+              ) as "root.user_data"
+          ) as "root.user"
+      ) as "root.user" on ('true')
+  ) as "root""#;
 
-        select coalesce(json_agg("root.user", 'null') as "root.user"
-        from (
-            select row_to_json(
-                select "json_spec"
-                from (
-                    select "user"."id" as"id" ,
-select "user"."name" as"name"
-                ) as "json_spec"
-            )
-            from (
-                select id,name from users where "author" = id as "root.user"
+        assert_eq!(
+            format(&sql, &QueryParams::None, FormatOptions::default()),
+            expected
+        )
+    }
 
-            )
-        ) as "root.user"
+    #[derive(Debug, Derivative)]
+    #[derivative(Default)]
+    struct DockerPostgres {
+        env_vars: HashMap<String, String>,
+        #[derivative(Default(value = "14.to_string()"))]
+        tag: String,
+    }
 
-            ) as user on ('true')
+    impl Image for DockerPostgres {
+        type Args = ();
 
-            )
-        ) as "root""#;
+        fn name(&self) -> String {
+            "postgres".to_owned()
+        }
 
-        println!("{}", sql);
-        println!("{}", expected);
+        fn tag(&self) -> String {
+            self.tag.to_owned()
+        }
+
+        fn ready_conditions(&self) -> Vec<WaitFor> {
+            vec![WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            )]
+        }
+
+        fn env_vars(&self) -> Box<dyn Iterator<Item = (&String, &String)> + '_> {
+            Box::new(self.env_vars.iter())
+        }
+    }
+
+    async fn base_test(sql: Vec<String>, query: String) -> Result<serde_json::Value, Error> {
+        let docker = clients::Cli::default();
+        let pg = docker.run(DockerPostgres {
+            env_vars: HashMap::from([("POSTGRES_PASSWORD".to_owned(), "postgres".to_owned())]),
+            tag: "14".to_owned(),
+        });
+
+        let port = pg.get_host_port(5432);
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&format!(
+                "postgres://postgres:postgres@0.0.0.0:{}/postgres",
+                port
+            ))
+            .await?;
+
+        let init = sql
+            .iter()
+            .map(|init_sql| sqlx::query(init_sql).execute(&pool))
+            .collect_vec();
+
+        let _ = try_join_all(init).await?;
+
+        let (tables, constraints, cols, references) = fetch_introspection_data(&pool).await?;
+        let introspection = convert_introspect_data(tables, constraints, cols, references);
+        let query = parse_query(query).unwrap();
+        let intermediate =
+            to_intermediate(&query, &introspection.tables, &introspection.relationships2);
+
+        println!("{:#?}", intermediate);
+
+        let executable_sql = intermediate
+            .iter()
+            .map(|inter| inter.to_json_sql().to_owned())
+            .collect_vec()
+            .first()
+            .unwrap()
+            .to_owned();
+
+        println!("{}", executable_sql);
+
+        let res: (serde_json::Value,) = sqlx::query_as(&executable_sql).fetch_one(&pool).await?;
+        pg.stop();
+        Ok(res.0)
+    }
+
+    #[tokio::test]
+    async fn simple_table() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text)"),
+            String::from("insert into test values(1, 'rune')"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                get_test_by_id(a: 1) {
+                    a
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!({"a": 1, "b": "rune"});
+
+        assert_eq!(expected, actual);
+
+        Ok(())
     }
 }

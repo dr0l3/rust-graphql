@@ -21,29 +21,13 @@ In GraphQL this could look like this
 
 ```graphql
 type Example {
-    id: Uuid!
+    id: ID!
     txt: String!
     number: Int
 }
 
 type Query {
-    get_example_by_id(id: Uuid!): Example
-    list_example(limit: Int!, offset: Int!) [Example!]!
-}
-```
-
-## 
-
-
-```graphql
-query Blah {
-    hello {
-        a
-        b
-        c {
-            d
-            e
-        }
-    }
+    get_example_by_id(id: ID!): Example
+    list_example(limit: Int!, offset: Int!): [Example!]!
 }
 ```
