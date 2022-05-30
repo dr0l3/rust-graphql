@@ -437,11 +437,17 @@ fn field_to_table_selection(
                         expr: match op_arg.tpe {
                             InputType::GraphQLInteger => field_arg_value.node.to_string(),
                             InputType::GraphQLString => {
-                                format!(r#"{}"#, field_arg_value.node.to_string())
+                                format!(
+                                    r#"'{}'"#,
+                                    field_arg_value.node.to_string().trim_matches('"')
+                                )
                             }
                             InputType::GraphQLBoolean => field_arg_value.node.to_string(),
                             InputType::GraphQLID => {
-                                format!(r#"{}"#, field_arg_value.node.to_string())
+                                format!(
+                                    r#"'{}'"#,
+                                    field_arg_value.node.to_string().trim_matches('"')
+                                )
                             }
                         },
                     }
@@ -687,7 +693,7 @@ mod tests {
             where_clauses: vec![WhereClause {
                 left_path: None,
                 left_column: "id".to_string(),
-                expr: r#""hello""#.to_string(),
+                expr: r#"'hello'"#.to_string(),
             }],
             return_type: ReturnType::Object,
             field_name: "get_example_by_id".to_string(),
@@ -746,7 +752,7 @@ mod tests {
             where_clauses: vec![WhereClause {
                 left_path: None,
                 left_column: "id".to_string(),
-                expr: r#""hello""#.to_string(),
+                expr: r#"'hello'"#.to_string(),
             }],
             return_type: ReturnType::Object,
             field_name: "get_post_by_id".to_string(),
@@ -963,6 +969,33 @@ from
 
         let actual = base_test(init_sql, graphql_query).await?;
         let expected = serde_json::json!({"a": 1, "b": "rune"});
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simple_table_uuid_pk() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a uuid primary key, b text)"),
+            String::from("insert into test values('1ea0f505-b0e6-4a97-881e-a105fd580998', 'rune')"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                get_test_by_id(a: "1ea0f505-b0e6-4a97-881e-a105fd580998") {
+                    a
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected =
+            serde_json::json!({"a": "1ea0f505-b0e6-4a97-881e-a105fd580998", "b": "rune"});
 
         assert_eq!(expected, actual);
 
