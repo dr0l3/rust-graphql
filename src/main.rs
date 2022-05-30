@@ -969,6 +969,7 @@ from
         Ok(())
     }
 
+    #[tokio::test]
     async fn simple_table_subset_select() -> Result<(), Error> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text)"),
