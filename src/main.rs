@@ -2,6 +2,7 @@ mod postgres_introspect;
 
 extern crate dotenv;
 
+use crate::futures_util::StreamExt;
 use async_graphql::{
     parser::parse_query,
     parser::types::{ExecutableDocument, Field, OperationDefinition, Selection},
@@ -29,18 +30,25 @@ pub struct Op {
     pub args: Vec<Arg>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum InputType {
-    GraphQLInteger,
-    GraphQLString,
-    GraphQLBoolean,
-    GraphQLID,
+    GraphQLInteger { default: Option<i32> },
+    GraphQLString { default: Option<String> },
+    GraphQLBoolean { default: Option<bool> },
+    GraphQLID { default: Option<String> },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum ArgType {
+    ColumnName,
+    BuiltIn,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Arg {
     name: String,
     tpe: InputType,
+    arg_type: ArgType,
 }
 
 impl Table {
@@ -151,6 +159,11 @@ async fn main() -> Result<(), String> {
 
     Ok(())
 }
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct TablePagination {
+    limit: u32,
+    offset: u32,
+}
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct TableSelection {
@@ -158,6 +171,7 @@ struct TableSelection {
     column_names: Vec<String>,
     left_joins: Vec<LeftJoin>,
     where_clauses: Vec<WhereClause>,
+    pagination: Option<TablePagination>,
     return_type: ReturnType,
     field_name: String,
     path: String,
@@ -177,8 +191,8 @@ struct JoinCondition {
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 struct WhereClause {
-    left_path: Option<String>,
-    left_column: String,
+    path: Option<String>,
+    column_name: String,
     expr: String,
 }
 
@@ -195,14 +209,16 @@ impl TableSelection {
             .iter()
             .map(
                 |WhereClause {
-                     left_path,
-                     left_column,
+                     path,
+                     column_name,
                      expr,
                  }| {
-                    let path_string = left_path.to_owned().map_or("".to_string(), |path| {
+                    let path_string = path.to_owned().map_or("".to_string(), |path| {
                         format!(r#""{}_data"."#, path).to_string()
                     });
-                    format!(r#"{}"{}" = {}"#, path_string, left_column, expr)
+                    let left_side = format!(r#"{}"{}""#, path_string, column_name);
+
+                    format!(r#"{} = {}"#, left_side, expr)
                 },
             )
             .join(" AND ");
@@ -213,7 +229,16 @@ impl TableSelection {
             "".to_string()
         };
 
-        format!("select * from {} {}", self.table_name, where_string)
+        let pagination = self
+            .pagination
+            .as_ref()
+            .map(|pag| format!("limit {} offset {}", pag.limit, pag.offset))
+            .unwrap_or(String::from(""));
+
+        format!(
+            "select * from {} {} {}",
+            self.table_name, where_string, pagination
+        )
     }
 
     /*
@@ -365,10 +390,12 @@ fn field_to_table_selection(
         .map(|Positioned { node, .. }| inner(node))
         .filter(|field| field.selection_set.node.items.len() > 0)
         .map(|field| {
+            println!("wutwutwut {} {}", table.name, field.name.node.to_string());
+
             let relationship = relationships2
                 .iter()
                 .find(|relationship| {
-                    relationship.table_name.contains(&table.name)
+                    relationship.table_name.eq(&table.name)
                         && relationship
                             .field_name
                             .contains(&field.name.node.to_string())
@@ -424,33 +451,36 @@ fn field_to_table_selection(
 
             op.args
                 .iter()
+                .filter(|op_arg| op_arg.arg_type.eq(&ArgType::ColumnName)) //TODO: Should fix the data structure
                 .map(|op_arg| {
-                    let (_, field_arg_value) = field
+                    let field_arg = field
                         .arguments
                         .iter()
                         .find(|(field_arg, _)| op_arg.name.eq(&field_arg.node))
-                        .unwrap();
-
-                    println!("{:?}", op_arg);
+                        .map(|(_, value)| value.node.to_string());
 
                     WhereClause {
-                        left_path: None,
-                        left_column: op_arg.name.to_owned(),
-                        expr: match op_arg.tpe {
-                            InputType::GraphQLInteger => field_arg_value.node.to_string(),
-                            InputType::GraphQLString => {
-                                format!(
-                                    r#"'{}'"#,
-                                    field_arg_value.node.to_string().trim_matches('"')
-                                )
-                            }
-                            InputType::GraphQLBoolean => field_arg_value.node.to_string(),
-                            InputType::GraphQLID => {
-                                format!(
-                                    r#"'{}'"#,
-                                    field_arg_value.node.to_string().trim_matches('"')
-                                )
-                            }
+                        path: None,
+                        column_name: op_arg.name.to_owned(),
+                        expr: match &op_arg.tpe {
+                            InputType::GraphQLInteger { default } => field_arg
+                                .or(default.map(|num| num.to_string()))
+                                .expect("Unable to extract value for arg"),
+                            InputType::GraphQLString { default } => field_arg
+                                .or(default.to_owned())
+                                .map(|field_value| {
+                                    format!(r#"'{}'"#, field_value.trim_matches('"'))
+                                })
+                                .expect("Unable to extract value for arg"),
+                            InputType::GraphQLBoolean { default } => field_arg
+                                .or(default.map(|v| v.to_string()))
+                                .expect("Unable to extract value for arg"),
+                            InputType::GraphQLID { default } => field_arg
+                                .or(default.to_owned())
+                                .map(|field_value| {
+                                    format!(r#"'{}'"#, field_value.trim_matches('"'))
+                                })
+                                .expect("Unable to extract value for arg"),
                         },
                     }
                 })
@@ -458,11 +488,90 @@ fn field_to_table_selection(
         }
         SearchPlace::Relationship { relationship, path } => {
             vec![WhereClause {
-                left_path: Some(path.to_string()),
-                left_column: relationship.column_name.to_string(),
+                path: Some(path.to_string()),
+                column_name: relationship.column_name.to_string(),
                 expr: format!(r#""{}""#, relationship.target_column_name.to_string()),
             }]
         }
+    };
+
+    let pagination = match search_place {
+        SearchPlace::TopLevel => {
+            let op = table
+                .toplevel_ops
+                .iter()
+                .find(|op| op.name.eq(&field.name.node))
+                .unwrap();
+
+            let limit_arg = field
+                .arguments
+                .iter()
+                .find(|(field_arg, _)| field_arg.node.eq("limit"))
+                .map(|(_, value)| value.node.to_string().parse::<u32>().unwrap())
+                .or(op
+                    .args
+                    .iter()
+                    .find(|op_arg| op_arg.name.eq("limit"))
+                    .and_then(|op_arg| match &op_arg.tpe {
+                        InputType::GraphQLInteger { default } => {
+                            default.to_owned().map(|num| num as u32)
+                        }
+                        InputType::GraphQLString { default } => {
+                            default.to_owned().map(|str| str.parse::<u32>().unwrap())
+                        }
+                        InputType::GraphQLBoolean { .. } => None,
+                        InputType::GraphQLID { .. } => None,
+                    }));
+
+            let offset_arg = field
+                .arguments
+                .iter()
+                .find(|(field_arg, _)| field_arg.node.eq("offset"))
+                .map(|(_, value)| value.node.to_string().parse::<u32>().unwrap())
+                .or(op
+                    .args
+                    .iter()
+                    .find(|op_arg| op_arg.name.eq("offset"))
+                    .and_then(|op_arg| match &op_arg.tpe {
+                        InputType::GraphQLInteger { default } => {
+                            default.to_owned().map(|num| num as u32)
+                        }
+                        InputType::GraphQLString { default } => {
+                            default.to_owned().map(|str| str.parse::<u32>().unwrap())
+                        }
+                        InputType::GraphQLBoolean { .. } => None,
+                        InputType::GraphQLID { .. } => None,
+                    }));
+
+            Some(TablePagination {
+                limit: limit_arg.unwrap_or(25u32),
+                offset: offset_arg.unwrap_or(0),
+            })
+        }
+        SearchPlace::Relationship { relationship, .. } => match relationship.return_type {
+            ReturnType::Object => Some(TablePagination {
+                limit: 1,
+                offset: 0,
+            }),
+            ReturnType::Array => {
+                let limit_arg = field
+                    .arguments
+                    .iter()
+                    .find(|(field_arg, _)| field_arg.node.eq("limit"))
+                    .map(|(_, value)| value.node.to_string().parse::<u32>().unwrap());
+
+                let offset_arg = field
+                    .arguments
+                    .iter()
+                    .find(|(field_arg, _)| field_arg.node.eq("offset"))
+                    .map(|(_, value)| value.node.to_string().parse::<u32>().unwrap());
+
+                Some(TablePagination {
+                    limit: limit_arg.unwrap_or(25u32),
+                    offset: offset_arg.unwrap_or(0),
+                })
+            }
+        },
     };
 
     let return_type = match search_place {
@@ -483,6 +592,7 @@ fn field_to_table_selection(
         column_names: columns,
         table_name: table.name.to_owned(),
         return_type,
+        pagination,
         field_name: field.name.node.to_string(),
         path,
     }
@@ -543,329 +653,6 @@ mod tests {
     use sqlx::query::Query;
     use sqlx::{postgres::PgPoolOptions, Error, Pool, Postgres, Row};
     use testcontainers::core::WaitFor;
-
-    fn single_table() -> Vec<Table> {
-        vec![Table {
-            columns: vec![
-                Column {
-                    name: "number".to_string(),
-                    datatype: "integer".to_string(),
-                    required: false,
-                    unique: false,
-                },
-                Column {
-                    name: "txt".to_string(),
-                    datatype: "text".to_string(),
-                    required: false,
-                    unique: false,
-                },
-            ],
-            primary_keys: vec![PrimaryKey(Column {
-                name: "id".to_string(),
-                datatype: "uuid".to_string(),
-                required: true,
-                unique: true,
-            })],
-            name: "example".to_string(),
-            toplevel_ops: vec![Op {
-                name: "get_example_by_id".to_string(),
-                return_type: ReturnType::Object,
-                args: vec![Arg {
-                    name: "id".to_string(),
-                    tpe: InputType::GraphQLID,
-                }],
-            }],
-        }]
-    }
-
-    fn two_tables() -> (Vec<Table>, Vec<Relationship2>) {
-        let author_col = Column {
-            name: "author".to_string(),
-            datatype: "uuid".to_string(),
-            required: true,
-            unique: false,
-        };
-
-        let user_id_column = Column {
-            name: "id".to_string(),
-            datatype: "uuid".to_string(),
-            required: true,
-            unique: true,
-        };
-        let tables = vec![
-            Table {
-                columns: vec![
-                    Column {
-                        name: "content".to_string(),
-                        datatype: "text".to_string(),
-                        required: false,
-                        unique: false,
-                    },
-                    author_col.to_owned(),
-                ],
-                primary_keys: vec![PrimaryKey(Column {
-                    name: "id".to_string(),
-                    datatype: "uuid".to_string(),
-                    required: true,
-                    unique: true,
-                })],
-                name: "posts".to_string(),
-                toplevel_ops: vec![Op {
-                    name: "get_post_by_id".to_string(),
-                    return_type: ReturnType::Object,
-                    args: vec![Arg {
-                        name: "id".to_string(),
-                        tpe: InputType::GraphQLID,
-                    }],
-                }],
-            },
-            Table {
-                columns: vec![
-                    Column {
-                        name: "age".to_string(),
-                        datatype: "integer".to_string(),
-                        required: false,
-                        unique: false,
-                    },
-                    Column {
-                        name: "name".to_string(),
-                        datatype: "text".to_string(),
-                        required: false,
-                        unique: false,
-                    },
-                ],
-                primary_keys: vec![PrimaryKey(user_id_column.to_owned())],
-                name: "users".to_string(),
-                toplevel_ops: vec![Op {
-                    name: "get_user_by_id".to_string(),
-                    return_type: ReturnType::Object,
-                    args: vec![Arg {
-                        name: "id".to_string(),
-                        tpe: InputType::GraphQLID,
-                    }],
-                }],
-            },
-        ];
-
-        let relationships2 = vec![
-            Relationship2 {
-                table_name: "posts".to_string(),
-                column_name: author_col.name.to_owned(),
-                target_table_name: "users".to_string(),
-                target_column_name: user_id_column.name.to_string(),
-                field_name: "users".to_string(),
-                return_type: ReturnType::Object,
-                column_optional: false,
-            },
-            Relationship2 {
-                table_name: "users".to_string(),
-                column_name: user_id_column.name.to_string(),
-                target_table_name: "posts".to_string(),
-                target_column_name: author_col.name.to_string(),
-                field_name: "posts".to_string(),
-                return_type: ReturnType::Array,
-                column_optional: false,
-            },
-        ];
-
-        (tables, relationships2)
-    }
-
-    #[test]
-    fn simple_table_not_all_columns_json() {
-        let query = r#"
-        query get_example {
-            get_example_by_id(id: "hello") {
-              id
-              number
-            }
-          }
-
-        "#;
-
-        let parsed_query = parse_query(query).unwrap();
-
-        let intermediate = to_intermediate(&parsed_query, &single_table(), &vec![]);
-
-        let expected = vec![TableSelection {
-            table_name: "example".to_string(),
-            column_names: vec!["id".to_string(), "number".to_string()],
-            left_joins: vec![],
-
-            where_clauses: vec![WhereClause {
-                left_path: None,
-                left_column: "id".to_string(),
-                expr: r#"'hello'"#.to_string(),
-            }],
-            return_type: ReturnType::Object,
-            field_name: "get_example_by_id".to_string(),
-            path: "root".to_string(),
-        }];
-
-        println!("{:#?}", intermediate);
-
-        assert_eq!(intermediate, expected)
-    }
-
-    #[test]
-    fn join_table_json() {
-        let query = r#"
-        query get_post_with_user {
-            get_post_by_id(id: "hello") {
-                id
-                content
-                user {
-                    id
-                    name
-                }
-            }
-        }
-        "#;
-
-        let parsed_query = parse_query(query).unwrap();
-        let (tables, relationships2) = two_tables();
-        let intermediate = to_intermediate(&parsed_query, &tables, &relationships2);
-
-        let expected = vec![TableSelection {
-            table_name: "posts".to_string(),
-            column_names: vec!["id".to_string(), "content".to_string()],
-            left_joins: vec![LeftJoin {
-                right_table: TableSelection {
-                    table_name: "users".to_string(),
-                    column_names: vec!["id".to_string(), "name".to_string()],
-                    left_joins: vec![],
-                    where_clauses: vec![{
-                        WhereClause {
-                            left_path: Some("root".to_string()),
-                            left_column: "author".to_string(),
-                            expr: r#""id""#.to_string(),
-                        }
-                    }],
-                    return_type: ReturnType::Object,
-                    field_name: "user".to_string(),
-
-                    path: "root.user".to_string(),
-                },
-                join_conditions: vec![JoinCondition {
-                    left_col: "users".to_string(),
-                    right_col: "id".to_string(),
-                }],
-            }],
-            where_clauses: vec![WhereClause {
-                left_path: None,
-                left_column: "id".to_string(),
-                expr: r#"'hello'"#.to_string(),
-            }],
-            return_type: ReturnType::Object,
-            field_name: "get_post_by_id".to_string(),
-            path: "root".to_string(),
-        }];
-
-        assert_eq!(intermediate, expected);
-    }
-
-    #[test]
-    fn join_sql() {
-        let intermediate = TableSelection {
-            table_name: "posts".to_string(),
-            column_names: vec!["id".to_string(), "content".to_string()],
-            left_joins: vec![LeftJoin {
-                right_table: TableSelection {
-                    table_name: "users".to_string(),
-                    column_names: vec!["id".to_string(), "name".to_string()],
-                    left_joins: vec![],
-                    where_clauses: vec![{
-                        WhereClause {
-                            left_path: Some("root".to_string()),
-                            left_column: "author".to_string(),
-                            expr: r#""id""#.to_string(),
-                        }
-                    }],
-                    return_type: ReturnType::Object,
-                    field_name: "user".to_string(),
-
-                    path: "root.user".to_string(),
-                },
-                join_conditions: vec![JoinCondition {
-                    left_col: "users".to_string(),
-                    right_col: "id".to_string(),
-                }],
-            }],
-            where_clauses: vec![WhereClause {
-                left_path: None,
-                left_column: "id".to_string(),
-                expr: r#""04510aac-ad26-48ee-b081-47ce2f5ee3f2""#.to_string(),
-            }],
-            return_type: ReturnType::Object,
-            field_name: "get_post_by_id".to_string(),
-            path: "root".to_string(),
-        };
-
-        let sql = intermediate.to_json_sql();
-
-        let expected = r#"select
-  coalesce((json_agg("root") -> 0), 'null') as "get_post_by_id"
-from
-  (
-    select
-      row_to_json(
-        (
-          select
-            "json_spec"
-          from
-            (
-              select
-                "root_data"."id" as "id",
-                "root_data"."content" as "content",
-                "root.user"."user" as "user"
-            ) as "json_spec"
-        )
-      ) as "root"
-    from
-      (
-        select
-          *
-        from
-          posts
-        where
-          "id" = "04510aac-ad26-48ee-b081-47ce2f5ee3f2"
-      ) as "root_data"
-      LEFT OUTER JOIN LATERAL (
-        select
-          coalesce((json_agg("root.user") -> 0), 'null') as "user"
-        from
-          (
-            select
-              row_to_json(
-                (
-                  select
-                    "json_spec"
-                  from
-                    (
-                      select
-                        "root.user_data"."id" as "id",
-                        "root.user_data"."name" as "name"
-                    ) as "json_spec"
-                )
-              ) as "root.user"
-            from
-              (
-                select
-                  *
-                from
-                  users
-                where
-                  "root_data"."author" = "id"
-              ) as "root.user_data"
-          ) as "root.user"
-      ) as "root.user" on ('true')
-  ) as "root""#;
-
-        assert_eq!(
-            format(&sql, &QueryParams::None, FormatOptions::default()),
-            expected
-        )
-    }
 
     #[derive(Debug, Derivative)]
     #[derivative(Default)]
@@ -1074,7 +861,7 @@ from
         let graphql_query = String::from(
             r#"
             query test {
-                get_test{
+                list_test{
                     a
                     b
                 }
@@ -1104,7 +891,7 @@ from
         let graphql_query = String::from(
             r#"
             query test {
-                get_test2 {
+                list_test2 {
                     c
                     d
                     test {
@@ -1118,6 +905,150 @@ from
 
         let actual = base_test(init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"c": 1, "d": 1,"test":{"a": 1, "b": "rune"}}, {"c": 2, "d": 2,"test":{"a": 2, "b": "rune2"}}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simple_table_get_some_with_pagination() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a uuid primary key, b text)"),
+            String::from("insert into test values('1ea0f505-b0e6-4a97-881e-a105fd580998', 'rune')"),
+            String::from(
+                "insert into test values('78a17f38-91fd-48be-a985-3342ab5f65c5', 'rune2')",
+            ),
+            String::from(
+                "insert into test values('2b9b475b-95dc-416c-a6cf-5e3dbdba3cd5', 'rune3')",
+            ),
+            String::from(
+                "insert into test values('9401419b-da9e-4359-8bd5-dd405d48642b', 'rune4')",
+            ),
+            String::from(
+                "insert into test values('72a99d4a-0e63-44f0-8c2a-c4a9f9ae1d8e', 'rune5')",
+            ),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                list_test(limit: 4){
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected =
+            serde_json::json!([{"b": "rune"}, {"b": "rune2"}, {"b": "rune3"}, {"b": "rune4"}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simple_table_get_all_with_pagination_and_offset() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a uuid primary key, b text)"),
+            String::from("insert into test values('1ea0f505-b0e6-4a97-881e-a105fd580998', 'rune')"),
+            String::from(
+                "insert into test values('78a17f38-91fd-48be-a985-3342ab5f65c5', 'rune2')",
+            ),
+            String::from(
+                "insert into test values('2b9b475b-95dc-416c-a6cf-5e3dbdba3cd5', 'rune3')",
+            ),
+            String::from(
+                "insert into test values('9401419b-da9e-4359-8bd5-dd405d48642b', 'rune4')",
+            ),
+            String::from(
+                "insert into test values('72a99d4a-0e63-44f0-8c2a-c4a9f9ae1d8e', 'rune5')",
+            ),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                list_test(limit: 4, offset: 1){
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected =
+            serde_json::json!([{"b": "rune2"}, {"b": "rune3"}, {"b": "rune4"},{"b": "rune5"}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nested_pagination() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text);"),
+            String::from("insert into test values(1, 'rune');"),
+            String::from("insert into test values(2, 'rune2')"),
+            String::from("create table test2(c int primary key, d int references test(a));"),
+            String::from("insert into test2 values(1, 1);"),
+            String::from("insert into test2 values(2, 1);"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                get_test_by_id(a: 1) {
+                    a
+                    b
+                    test2(limit: 1) {
+                        c
+                        d
+                    }
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!({"a": 1, "b": "rune", "test2": [{"c": 1, "d": 1}]});
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nested_pagination_with_offset() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text);"),
+            String::from("insert into test values(1, 'rune');"),
+            String::from("insert into test values(2, 'rune2')"),
+            String::from("create table test2(c int primary key, d int references test(a));"),
+            String::from("insert into test2 values(1, 1);"),
+            String::from("insert into test2 values(2, 1);"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                get_test_by_id(a: 1) {
+                    a
+                    b
+                    test2(limit: 1, offset: 1) {
+                        c
+                        d
+                    }
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!({"a": 1, "b": "rune", "test2": [{"c": 2, "d": 1}]});
 
         assert_eq!(expected, actual);
 

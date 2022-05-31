@@ -1,6 +1,6 @@
 use crate::InputType::{GraphQLID, GraphQLInteger, GraphQLString};
 use crate::{
-    ok, Arg, Column, Op, PrimaryKey, Relationship2, ReturnType, Table, TableColumm,
+    ok, Arg, ArgType, Column, Op, PrimaryKey, Relationship2, ReturnType, Table, TableColumm,
     TableReferences, TableRelationship, TableRow, TableUniqueConstraint, TableView,
 };
 use itertools::Itertools;
@@ -113,20 +113,32 @@ pub fn convert_introspect_data(
                                 Arg {
                                     name: pk.name.to_owned(),
                                     tpe: match pk.datatype.as_str() {
-                                        "text" => GraphQLString,
-                                        "int" => GraphQLInteger,
-                                        "integer" => GraphQLInteger,
-                                        "uuid" => GraphQLID,
-                                        _ => GraphQLString,
+                                        "text" => GraphQLString { default: None },
+                                        "int" => GraphQLInteger { default: None },
+                                        "integer" => GraphQLInteger { default: None },
+                                        "uuid" => GraphQLID { default: None },
+                                        _ => GraphQLString { default: None },
                                     },
+                                    arg_type: ArgType::ColumnName,
                                 }
                             })
                             .collect_vec(),
                     },
                     Op {
-                        name: format!("get_{}", table.name),
+                        name: format!("list_{}", table.name),
                         return_type: ReturnType::Array,
-                        args: vec![],
+                        args: vec![
+                            Arg {
+                                name: "limit".to_string(),
+                                tpe: GraphQLInteger { default: Some(25) },
+                                arg_type: ArgType::BuiltIn,
+                            },
+                            Arg {
+                                name: "offset".to_string(),
+                                tpe: GraphQLInteger { default: Some(0) },
+                                arg_type: ArgType::BuiltIn,
+                            },
+                        ],
                     },
                 ]
             } else {
@@ -188,7 +200,7 @@ pub fn convert_introspect_data(
                     column_name: column.name.to_string(),
                     target_table_name: foreign_table.name.to_string(),
                     target_column_name: foreign_column.name.to_string(),
-                    field_name,
+                    field_name: format!("{}", foreign_table.name.to_string()),
                     return_type,
                     column_optional: !column.required,
                 },
@@ -197,7 +209,7 @@ pub fn convert_introspect_data(
                     column_name: foreign_column.name.to_string(),
                     target_table_name: table.name.to_string(),
                     target_column_name: column.name.to_string(),
-                    field_name: format!("{}", foreign_table.name), // TODO: Better
+                    field_name: format!("{}", table.name), // TODO: Better
                     return_type: second_return_type,
                     column_optional: !foreign_column.required,
                 },

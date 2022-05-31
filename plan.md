@@ -1,17 +1,22 @@
 # Working stuff
 
 - Select
-  - Single table
+  - Get by id
+  - List
+    - Pagination
 - Without using fragments
 - And only using inline variable
 
 # Non working stuff
-
 - Fragments
 - Other operations
-  - List
   - Search
+    - By indexed fields
+    - By non-indexed fields
+    - Pagination
   - Update
+  - Insert
+  - Delete
 - Efficiency
   - Binds in SQL
 - Other databases
