@@ -101,27 +101,34 @@ pub fn convert_introspect_data(
                 .collect_vec();
 
             let toplevel_ops = if !primary_keys.is_empty() {
-                vec![Op {
-                    name: format!("get_{}_by_id", table.name),
-                    return_type: ReturnType::Object,
-                    args: primary_keys
-                        .iter()
-                        .map(|pk| {
-                            println!("{:?}", pk);
+                vec![
+                    Op {
+                        name: format!("get_{}_by_id", table.name),
+                        return_type: ReturnType::Object,
+                        args: primary_keys
+                            .iter()
+                            .map(|pk| {
+                                println!("{:?}", pk);
 
-                            Arg {
-                                name: pk.name.to_owned(),
-                                tpe: match pk.datatype.as_str() {
-                                    "text" => GraphQLString,
-                                    "int" => GraphQLInteger,
-                                    "integer" => GraphQLInteger,
-                                    "uuid" => GraphQLID,
-                                    _ => GraphQLString,
-                                },
-                            }
-                        })
-                        .collect_vec(),
-                }]
+                                Arg {
+                                    name: pk.name.to_owned(),
+                                    tpe: match pk.datatype.as_str() {
+                                        "text" => GraphQLString,
+                                        "int" => GraphQLInteger,
+                                        "integer" => GraphQLInteger,
+                                        "uuid" => GraphQLID,
+                                        _ => GraphQLString,
+                                    },
+                                }
+                            })
+                            .collect_vec(),
+                    },
+                    Op {
+                        name: format!("get_{}", table.name),
+                        return_type: ReturnType::Array,
+                        args: vec![],
+                    },
+                ]
             } else {
                 vec![]
             };

@@ -280,6 +280,8 @@ impl TableSelection {
             }
         };
 
+        println!("{:?} -> {}", self.return_type, selector);
+
         format!(
             r#"
         select coalesce({selector}, {default}) as "{field_name}" 
@@ -468,7 +470,7 @@ fn field_to_table_selection(
             table
                 .toplevel_ops
                 .iter()
-                .find(|op| op.name.contains(&field.name.node.to_string()))
+                .find(|op| op.name.eq(&field.name.node.to_string()))
                 .expect("Unable to find top level ops")
                 .return_type
         }
@@ -1053,6 +1055,69 @@ from
 
         let actual = base_test(init_sql, graphql_query).await?;
         let expected = serde_json::json!({"c": 1, "d": 1,"test":{"a": 1, "b": "rune"}});
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simple_table_get_all() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a uuid primary key, b text)"),
+            String::from("insert into test values('1ea0f505-b0e6-4a97-881e-a105fd580998', 'rune')"),
+            String::from(
+                "insert into test values('78a17f38-91fd-48be-a985-3342ab5f65c5', 'rune2')",
+            ),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                get_test{
+                    a
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!([{"a": "1ea0f505-b0e6-4a97-881e-a105fd580998", "b": "rune"}, {"a": "78a17f38-91fd-48be-a985-3342ab5f65c5", "b": "rune2"}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_docker_list_all() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text);"),
+            String::from("insert into test values(1, 'rune');"),
+            String::from("insert into test values(2, 'rune2')"),
+            String::from("create table test2(c int primary key, d int references test(a));"),
+            String::from("insert into test2 values(1, 1);"),
+            String::from("insert into test2 values(2, 2);"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                get_test2 {
+                    c
+                    d
+                    test {
+                        a
+                        b
+                    }
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!([{"c": 1, "d": 1,"test":{"a": 1, "b": "rune"}}, {"c": 2, "d": 2,"test":{"a": 2, "b": "rune2"}}]);
 
         assert_eq!(expected, actual);
 
