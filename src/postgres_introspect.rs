@@ -85,7 +85,10 @@ pub fn convert_introspect_data(
                                 || contraint.constraint_type.contains("PRIMARY KEY")
                         })
                         .find(|constraint| {
-                            constraint.key_column.contains(&col.column_name.to_string())
+                            constraint
+                                .key_columns
+                                .iter()
+                                .contains(&col.column_name.to_string())
                         })
                         .is_some(),
                 })
@@ -100,7 +103,7 @@ pub fn convert_introspect_data(
                 .filter(|col| {
                     pk_contraints
                         .iter()
-                        .find(|pk_contraint| pk_contraint.key_column.contains(&col.name))
+                        .find(|pk_contraint| pk_contraint.key_columns.iter().contains(&col.name))
                         .is_some()
                 })
                 .collect_vec();
@@ -110,7 +113,7 @@ pub fn convert_introspect_data(
                 .filter(|col| {
                     pk_contraints
                         .iter()
-                        .find(|pk_contraint| pk_contraint.key_column.contains(&col.name))
+                        .find(|pk_contraint| pk_contraint.key_columns.iter().contains(&col.name))
                         .is_none()
                 })
                 .map(|col| col.to_owned().to_owned())
@@ -137,13 +140,24 @@ pub fn convert_introspect_data(
             let indexed_cols_ops = non_pk_indexed_cols
                 .iter()
                 .map(|indexed_columns| {
+                    let column_combination_unique = constraints
+                        .iter()
+                        .filter(|constraint| constraint.constraint_type == "UNIQUE")
+                        .map(|constraint| &constraint.key_columns)
+                        .find(|cols| cols == &&indexed_columns.column_names)
+                        .is_some();
+
                     Operation {
                         name: format!(
                             "search_{}_by_{}",
                             indexed_columns.table_name,
                             indexed_columns.column_names.join("_")
-                        ), //TODO: Ehh?
-                        return_type: ReturnType::Array, //TODO: Is this column unique?
+                        ), //TODO: Improve naming
+                        return_type: if column_combination_unique {
+                            ReturnType::Object
+                        } else {
+                            ReturnType::Array
+                        },
                         args: indexed_columns
                             .column_names
                             .iter()
@@ -460,7 +474,7 @@ WHERE a.attnum > 0 AND n.nspname = 'public' AND i.indisunique IS TRUE;";
 #[derive(sqlx::FromRow, Debug, Clone)]
 pub struct TableConstraint {
     table_name: String,
-    key_column: String,
+    key_columns: Vec<String>,
     constraint_type: String,
 }
 
@@ -468,18 +482,21 @@ async fn get_constraints(pool: &Pool<Postgres>) -> Result<Vec<TableConstraint>, 
     let sql = "select kcu.table_schema,
        kcu.table_name,
        tco.constraint_name,
-       kcu.ordinal_position as position,
-       kcu.column_name as key_column,
-       tco.constraint_type
+       tco.constraint_type,
+       array_agg(kcu.column_name::text) as key_columns
 from information_schema.table_constraints tco
 join information_schema.key_column_usage kcu
      on kcu.constraint_name = tco.constraint_name
      and kcu.constraint_schema = tco.constraint_schema
      and kcu.constraint_name = tco.constraint_name
 where kcu.table_schema= 'public'
+group by
+     kcu.table_schema,
+     kcu.table_name,
+     tco.constraint_name,
+     tco.constraint_type
 order by kcu.table_schema,
-         kcu.table_name,
-         position;";
+         kcu.table_name;";
 
     Ok(sqlx::query_as(sql).fetch_all(pool).await?)
 }

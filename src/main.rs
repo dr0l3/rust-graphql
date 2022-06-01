@@ -136,7 +136,7 @@ pub struct PostgresIndexedColumns {
 struct TableUniqueConstraint {
     schema_name: String,
     table_name: String,
-    column_name: String,
+    column_names: Vec<String>,
 }
 
 #[tokio::main]
@@ -1159,6 +1159,61 @@ mod tests {
 
         let actual = base_test(init_sql, graphql_query).await?;
         let expected = serde_json::json!([]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_by_non_pk_compound_unique() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text, c text, unique(b,c))"),
+            String::from("insert into test values(1, 'rune', 'drole')"),
+            String::from("create index test_index on test(b, c)"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                search_test_by_b_c(b: "rune", c: "drole") {
+                    a
+                    b
+                    c
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!({"a": 1, "b": "rune", "c": "drole"});
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_by_non_pk_unique() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text unique)"),
+            String::from("insert into test values(1, 'rune')"),
+            String::from("create index test_index on test(b)"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                search_test_by_b(b: "rune") {
+                    a
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!({"a": 1, "b": "rune"});
 
         assert_eq!(expected, actual);
 
