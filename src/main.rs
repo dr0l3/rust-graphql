@@ -1,5 +1,6 @@
 mod postgres_introspect;
 
+extern crate core;
 extern crate dotenv;
 
 use crate::futures_util::StreamExt;
@@ -16,15 +17,15 @@ use std::fmt::{format, Display, Formatter};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
-pub struct Table {
+pub struct DatabaseTable {
     pub name: String,
     pub columns: Vec<Column>,
     pub primary_keys: Vec<PrimaryKey>,
-    pub toplevel_ops: Vec<Op>,
+    pub toplevel_ops: Vec<Operation>,
 }
 
 #[derive(Debug, Clone)]
-pub struct Op {
+pub struct Operation {
     pub name: String,
     pub return_type: ReturnType,
     pub args: Vec<Arg>,
@@ -51,7 +52,7 @@ pub struct Arg {
     arg_type: ArgType,
 }
 
-impl Table {
+impl DatabaseTable {
     fn get_all_columns(&self) -> impl Iterator<Item = &Column> {
         self.columns
             .iter()
@@ -77,7 +78,7 @@ pub struct PrimaryKey(Column);
 // - target_column is not unique -> GraphQL type is an array
 
 #[derive(Debug, Clone)]
-pub struct Relationship2 {
+pub struct DatabaseRelationship {
     table_name: String,
     column_name: String,
     target_table_name: String,
@@ -87,21 +88,8 @@ pub struct Relationship2 {
     column_optional: bool,
 }
 
-// really a two way relationship
-#[derive(Debug, Clone)]
-struct TableRelationship {
-    table: Table,
-    column: Column,
-    foreign_table: Table,
-    foreign_column: Column,
-    constraint_name: String,
-    field_name: String,
-    //table_to_foreign_field_name
-    //foreign_to
-}
-
 #[derive(sqlx::FromRow, Debug, Clone)]
-pub struct TableRow {
+pub struct PostgresTableRow {
     schema: String,
     name: String,
     table_type: String,
@@ -111,7 +99,7 @@ pub struct TableRow {
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
-pub struct TableColumm {
+pub struct PostgresTableColumm {
     column_name: String,
     table_name: String,
     is_nullable: String,
@@ -119,7 +107,7 @@ pub struct TableColumm {
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
-pub struct TableReferences {
+pub struct PostgresTableReferences {
     table_schema: String,
     table_name: String,
     column_name: String,
@@ -129,11 +117,19 @@ pub struct TableReferences {
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
-pub struct TableView {
+pub struct PostgresTableView {
     table_schema: String,
     table_name: String,
     is_updatable: String,
     is_insertable_into: String,
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+pub struct PostgresIndexedColumns {
+    table_name: String,
+    index_name: String,
+    column_names: Vec<String>,
+    schema_name: String,
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
@@ -150,10 +146,10 @@ async fn main() -> Result<(), String> {
         .connect("postgres://postgres:postgres@0.0.0.0:5439/dixa")
         .map_err(|err| err.to_string())
         .await?;
-    let (tables, constraints, columns, references) = fetch_introspection_data(&pool)
+    let (tables, constraints, columns, references, indexes) = fetch_introspection_data(&pool)
         .map_err(|err| err.to_string())
         .await?;
-    let results = convert_introspect_data(tables, constraints, columns, references);
+    let results = convert_introspect_data(tables, constraints, columns, references, indexes);
 
     println!("{:#?}", results);
 
@@ -340,16 +336,16 @@ fn inner(selection: &Selection) -> Field {
 enum SearchPlace {
     TopLevel,
     Relationship {
-        relationship: Relationship2,
+        relationship: DatabaseRelationship,
         path: String,
     },
 }
 
 fn field_to_table_selection(
     field: &Field,
-    tables: &Vec<Table>,
+    tables: &Vec<DatabaseTable>,
     search_place: &SearchPlace,
-    relationships2: &Vec<Relationship2>,
+    relationships2: &Vec<DatabaseRelationship>,
     path: String,
 ) -> TableSelection {
     let table = match search_place {
@@ -404,7 +400,7 @@ fn field_to_table_selection(
                 .to_owned();
             (field, relationship)
         })
-        .collect::<Vec<(Field, Relationship2)>>();
+        .collect::<Vec<(Field, DatabaseRelationship)>>();
 
     // I do know which joins have been selected
     // I do know which table "this" field corresponds to
@@ -600,8 +596,8 @@ fn field_to_table_selection(
 
 fn to_intermediate(
     query: &ExecutableDocument,
-    tables: &Vec<Table>,
-    relationships2: &Vec<Relationship2>,
+    tables: &Vec<DatabaseTable>,
+    relationships2: &Vec<DatabaseRelationship>,
 ) -> Vec<TableSelection> {
     let ops = query
         .operations
@@ -631,9 +627,9 @@ fn to_intermediate(
 #[cfg(test)]
 mod tests {
     use crate::{
-        convert_introspect_data, fetch_introspection_data, select, to_intermediate, Arg, InputType,
-        JoinCondition, LeftJoin, Op, Relationship2, ReturnType, SearchPlace, TableRelationship,
-        TableSelection, TryFutureExt, WhereClause,
+        convert_introspect_data, fetch_introspection_data, select, to_intermediate, Arg,
+        DatabaseRelationship, InputType, JoinCondition, LeftJoin, Operation, ReturnType,
+        SearchPlace, TableSelection, TryFutureExt, WhereClause,
     };
     use derivative::*;
     use futures::future::{join_all, try_join_all};
@@ -644,8 +640,8 @@ mod tests {
     use testcontainers::*;
 
     use crate::Column;
+    use crate::DatabaseTable;
     use crate::PrimaryKey;
-    use crate::Table;
     use async_graphql::parser::parse_query;
     use dockertest::waitfor::{MessageSource, MessageWait};
     use dockertest::{Composition, DockerTest, Source};
@@ -713,8 +709,9 @@ mod tests {
         //let init_res = try_join_all(init).await?;
         //println!("{:#?}", init_res);
 
-        let (tables, constraints, cols, references) = fetch_introspection_data(&pool).await?;
-        let introspection = convert_introspect_data(tables, constraints, cols, references);
+        let (tables, constraints, cols, references, indexes) =
+            fetch_introspection_data(&pool).await?;
+        let introspection = convert_introspect_data(tables, constraints, cols, references, indexes);
 
         println!("{:#?}", introspection);
         let query = parse_query(query).unwrap();
@@ -731,7 +728,10 @@ mod tests {
             .unwrap()
             .to_owned();
 
-        println!("{}", executable_sql);
+        println!(
+            "{}",
+            format(&executable_sql, &QueryParams::None, Default::default())
+        );
 
         let res: (serde_json::Value,) = sqlx::query_as(&executable_sql).fetch_one(&pool).await?;
         pg.stop();
@@ -1049,6 +1049,116 @@ mod tests {
 
         let actual = base_test(init_sql, graphql_query).await?;
         let expected = serde_json::json!({"a": 1, "b": "rune", "test2": [{"c": 2, "d": 1}]});
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_by_non_pk() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text)"),
+            String::from("insert into test values(1, 'rune')"),
+            String::from("create index test_index on test(b)"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                search_test_by_b(b: "rune") {
+                    a
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!([{"a": 1, "b": "rune"}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_by_non_pk_negative() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text)"),
+            String::from("insert into test values(1, 'rune')"),
+            String::from("create index test_index on test(b)"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                search_test_by_b(b: "hello") {
+                    a
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!([]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_by_non_pk_compound() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text, c text)"),
+            String::from("insert into test values(1, 'rune', 'drole')"),
+            String::from("create index test_index on test(b, c)"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                search_test_by_b_c(b: "rune", c: "drole") {
+                    a
+                    b
+                    c
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!([{"a": 1, "b": "rune", "c": "drole"}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_by_non_pk_compound_negative() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text, c text)"),
+            String::from("insert into test values(1, 'rune', 'drole')"),
+            String::from("create index test_index on test(b, c)"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                search_test_by_b_c(b: "rune", c: "non-existing") {
+                    a
+                    b
+                    c
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!([]);
 
         assert_eq!(expected, actual);
 

@@ -1,25 +1,29 @@
 use crate::InputType::{GraphQLID, GraphQLInteger, GraphQLString};
 use crate::{
-    ok, Arg, ArgType, Column, Op, PrimaryKey, Relationship2, ReturnType, Table, TableColumm,
-    TableReferences, TableRelationship, TableRow, TableUniqueConstraint, TableView,
+    ok, Arg, ArgType, Column, DatabaseRelationship, DatabaseTable, InputType, Operation,
+    PostgresIndexedColumns, PostgresTableColumm, PostgresTableReferences, PostgresTableRow,
+    PostgresTableView, PrimaryKey, ReturnType, TableUniqueConstraint,
 };
 use itertools::Itertools;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
+use std::borrow::Borrow;
+use std::ops::Deref;
 
 #[derive(Debug, Clone)]
 pub struct IntrospectionResult {
-    pub tables: Vec<Table>,
-    pub relationships2: Vec<Relationship2>,
+    pub tables: Vec<DatabaseTable>,
+    pub relationships2: Vec<DatabaseRelationship>,
 }
 
 pub async fn fetch_introspection_data(
     pool: &Pool<Postgres>,
 ) -> Result<
     (
-        Vec<TableRow>,
+        Vec<PostgresTableRow>,
         Vec<TableConstraint>,
-        Vec<TableColumm>,
-        Vec<TableReferences>,
+        Vec<PostgresTableColumm>,
+        Vec<PostgresTableReferences>,
+        Vec<PostgresIndexedColumns>,
     ),
     sqlx::Error,
 > {
@@ -27,14 +31,26 @@ pub async fn fetch_introspection_data(
     let constraints = get_constraints(pool).await?;
     let columns = get_all_columns(pool).await?;
     let references = get_all_references(pool).await?;
-    Ok((pg_tables, constraints, columns, references))
+    let indexes = get_indexes(pool).await?;
+    Ok((pg_tables, constraints, columns, references, indexes))
+}
+
+fn postgres_data_type_to_input(data_type: &str) -> InputType {
+    match data_type {
+        "text" => GraphQLString { default: None },
+        "int" => GraphQLInteger { default: None },
+        "integer" => GraphQLInteger { default: None },
+        "uuid" => GraphQLID { default: None },
+        _ => panic!("fn postgres_data_type_to_input"),
+    }
 }
 
 pub fn convert_introspect_data(
-    pg_tables: Vec<TableRow>,
+    pg_tables: Vec<PostgresTableRow>,
     constraints: Vec<TableConstraint>,
-    columns: Vec<TableColumm>,
-    references: Vec<TableReferences>,
+    columns: Vec<PostgresTableColumm>,
+    references: Vec<PostgresTableReferences>,
+    indexed_columns: Vec<PostgresIndexedColumns>,
 ) -> IntrospectionResult {
     let introspection_results = pg_tables
         .iter()
@@ -100,9 +116,56 @@ pub fn convert_introspect_data(
                 .map(|col| col.to_owned().to_owned())
                 .collect_vec();
 
-            let toplevel_ops = if !primary_keys.is_empty() {
-                vec![
-                    Op {
+            let non_pk_indexed_cols = indexed_columns
+                .iter()
+                .filter(|indexed_columns| {
+                    indexed_columns.table_name == table.name
+                        && indexed_columns.schema_name == table.schema
+                })
+                .filter(|index| match &index.column_names[..] {
+                    index_col_names if index_col_names.len() == primary_keys.len() => {
+                        !(index_col_names
+                            == primary_keys
+                                .iter()
+                                .map(|cols| cols.name.to_owned())
+                                .collect_vec())
+                    }
+                    _ => true,
+                })
+                .collect_vec();
+
+            let indexed_cols_ops = non_pk_indexed_cols
+                .iter()
+                .map(|indexed_columns| {
+                    Operation {
+                        name: format!(
+                            "search_{}_by_{}",
+                            indexed_columns.table_name,
+                            indexed_columns.column_names.join("_")
+                        ), //TODO: Ehh?
+                        return_type: ReturnType::Array, //TODO: Is this column unique?
+                        args: indexed_columns
+                            .column_names
+                            .iter()
+                            .map(|col_name| {
+                                let col = regular_cols
+                                    .iter()
+                                    .find(|col| col.name.eq(col_name))
+                                    .unwrap();
+                                Arg {
+                                    name: col_name.to_owned(),
+                                    tpe: postgres_data_type_to_input(&col.datatype),
+                                    arg_type: ArgType::ColumnName,
+                                }
+                            })
+                            .collect_vec(),
+                    }
+                })
+                .collect_vec();
+
+            let toplevel_ops: Vec<Operation> = if !primary_keys.is_empty() {
+                let base = vec![
+                    Operation {
                         name: format!("get_{}_by_id", table.name),
                         return_type: ReturnType::Object,
                         args: primary_keys
@@ -124,7 +187,7 @@ pub fn convert_introspect_data(
                             })
                             .collect_vec(),
                     },
-                    Op {
+                    Operation {
                         name: format!("list_{}", table.name),
                         return_type: ReturnType::Array,
                         args: vec![
@@ -140,12 +203,19 @@ pub fn convert_introspect_data(
                             },
                         ],
                     },
-                ]
+                    Operation {
+                        name: format!("search_{}", table.name),
+                        return_type: ReturnType::Array,
+                        args: vec![],
+                    },
+                ];
+
+                [base, indexed_cols_ops].concat()
             } else {
                 vec![]
             };
 
-            Table {
+            DatabaseTable {
                 name: table.name.to_string(),
                 columns: regular_cols,
                 primary_keys: primary_keys
@@ -195,7 +265,7 @@ pub fn convert_introspect_data(
             };
 
             vec![
-                Relationship2 {
+                DatabaseRelationship {
                     table_name: table.name.to_string(),
                     column_name: column.name.to_string(),
                     target_table_name: foreign_table.name.to_string(),
@@ -204,7 +274,7 @@ pub fn convert_introspect_data(
                     return_type,
                     column_optional: !column.required,
                 },
-                Relationship2 {
+                DatabaseRelationship {
                     table_name: foreign_table.name.to_string(),
                     column_name: foreign_column.name.to_string(),
                     target_table_name: table.name.to_string(),
@@ -223,7 +293,7 @@ pub fn convert_introspect_data(
     }
 }
 
-async fn get_tables(pool: &Pool<Postgres>) -> Result<Vec<TableRow>, sqlx::Error> {
+async fn get_tables(pool: &Pool<Postgres>) -> Result<Vec<PostgresTableRow>, sqlx::Error> {
     let sql = r#"SELECT n.nspname as "schema",
     c.relname as "name",
     CASE c.relkind 
@@ -245,24 +315,61 @@ async fn get_tables(pool: &Pool<Postgres>) -> Result<Vec<TableRow>, sqlx::Error>
   WHERE c.relkind IN ('r','p','s','')
         AND n.nspname = 'public'
   ORDER BY 1,2;"#;
-    Ok(sqlx::query_as::<_, TableRow>(sql).fetch_all(pool).await?)
+    Ok(sqlx::query_as::<_, PostgresTableRow>(sql)
+        .fetch_all(pool)
+        .await?)
 }
 
-async fn get_all_columns(pool: &Pool<Postgres>) -> Result<Vec<TableColumm>, sqlx::Error> {
+async fn get_all_columns(pool: &Pool<Postgres>) -> Result<Vec<PostgresTableColumm>, sqlx::Error> {
     let sql = "SELECT *
     FROM information_schema.columns
    WHERE table_schema = 'public'
        ;";
 
-    Ok(sqlx::query_as::<_, TableColumm>(sql)
+    Ok(sqlx::query_as::<_, PostgresTableColumm>(sql)
         .fetch_all(pool)
         .await?)
+}
+async fn get_indexes(pool: &Pool<Postgres>) -> Result<Vec<PostgresIndexedColumns>, sqlx::Error> {
+    let sql = "select
+    t.relname as table_name,
+    i.relname as index_name,
+    ns.nspname as schema_name,
+    array_agg(a.attname) as column_names
+from
+    pg_class t,
+    pg_class i,
+    pg_index ix,
+    pg_attribute a,
+    pg_namespace ns
+where
+    t.oid = ix.indrelid
+    and i.oid = ix.indexrelid
+    and a.attrelid = t.oid
+    and a.attnum = ANY(ix.indkey)
+    and t.relkind = 'r'
+    and i.relnamespace = ns.oid
+    and ns.nspname = 'public'
+group by
+    ns.nspname,
+    t.relname,
+    i.relname
+order by
+    t.relname,
+    i.relname;
+    ";
+
+    let indexes = sqlx::query_as::<_, PostgresIndexedColumns>(&sql)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(indexes)
 }
 
 async fn get_columns(
     pool: &Pool<Postgres>,
     table: &String,
-) -> Result<Vec<TableColumm>, sqlx::Error> {
+) -> Result<Vec<PostgresTableColumm>, sqlx::Error> {
     let sql = "SELECT *
     FROM information_schema.columns
    WHERE table_schema = 'public'
@@ -270,7 +377,7 @@ async fn get_columns(
        ;";
     println!("fetching columns for table {:#?}", table);
 
-    Ok(sqlx::query_as::<_, TableColumm>(sql)
+    Ok(sqlx::query_as::<_, PostgresTableColumm>(sql)
         .bind(table)
         .fetch_all(pool)
         .await?)
@@ -279,7 +386,7 @@ async fn get_columns(
 async fn get_references(
     pool: &Pool<Postgres>,
     table: &String,
-) -> Result<Vec<TableReferences>, sqlx::Error> {
+) -> Result<Vec<PostgresTableReferences>, sqlx::Error> {
     let sql = "SELECT
     tc.table_schema, 
     tc.constraint_name, 
@@ -301,7 +408,9 @@ WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name=$1;";
     Ok(sqlx::query_as(sql).bind(table).fetch_all(pool).await?)
 }
 
-async fn get_all_references(pool: &Pool<Postgres>) -> Result<Vec<TableReferences>, sqlx::Error> {
+async fn get_all_references(
+    pool: &Pool<Postgres>,
+) -> Result<Vec<PostgresTableReferences>, sqlx::Error> {
     let sql = "SELECT
     tc.table_schema, 
     tc.constraint_name, 
@@ -323,7 +432,7 @@ WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema='public';";
     Ok(sqlx::query_as(sql).fetch_all(pool).await?)
 }
 
-async fn get_views(pool: &Pool<Postgres>) -> Result<Vec<TableView>, sqlx::Error> {
+async fn get_views(pool: &Pool<Postgres>) -> Result<Vec<PostgresTableView>, sqlx::Error> {
     let sql = "select * from information_schema.views where table_schema = 'public';";
 
     Ok(sqlx::query_as(sql).fetch_all(pool).await?)
