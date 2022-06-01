@@ -1219,4 +1219,35 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn search_by_non_pk_with_pagination() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text)"),
+            String::from("insert into test values(1, 'rune')"),
+            String::from("insert into test values(2, 'rune')"),
+            String::from("insert into test values(3, 'rune')"),
+            String::from("insert into test values(4, 'rune')"),
+            String::from("insert into test values(5, 'rune')"),
+            String::from("create index test_index on test(b)"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                search_test_by_b(limit: 4, b: "rune") {
+                    a
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!([{"a": 1, "b": "rune"}, {"a": 2, "b": "rune"}, {"a": 3, "b": "rune"}, {"a": 4, "b": "rune"}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
 }

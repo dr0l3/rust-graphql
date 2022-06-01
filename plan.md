@@ -4,16 +4,17 @@
   - Get by id
   - List
     - Pagination
+  - Search
+    - By indexed fields
+    - By non-indexed fields
+    - Pagination
 - Without using fragments
 - And only using inline variable
 
 # Non working stuff
 - Fragments
+- Functions
 - Other operations
-  - Search
-    - By indexed fields
-    - By non-indexed fields
-    - Pagination
   - Update
   - Insert
   - Delete

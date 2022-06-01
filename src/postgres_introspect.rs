@@ -147,6 +147,39 @@ pub fn convert_introspect_data(
                         .find(|cols| cols == &&indexed_columns.column_names)
                         .is_some();
 
+                    let base_args = indexed_columns
+                        .column_names
+                        .iter()
+                        .map(|col_name| {
+                            let col = regular_cols
+                                .iter()
+                                .find(|col| col.name.eq(col_name))
+                                .unwrap();
+                            Arg {
+                                name: col_name.to_owned(),
+                                tpe: postgres_data_type_to_input(&col.datatype),
+                                arg_type: ArgType::ColumnName,
+                            }
+                        })
+                        .collect_vec();
+
+                    let pagination_args = if column_combination_unique {
+                        vec![]
+                    } else {
+                        vec![
+                            Arg {
+                                name: "limit".to_string(),
+                                tpe: GraphQLInteger { default: Some(25) },
+                                arg_type: ArgType::BuiltIn,
+                            },
+                            Arg {
+                                name: "offset".to_string(),
+                                tpe: GraphQLInteger { default: Some(0) },
+                                arg_type: ArgType::BuiltIn,
+                            },
+                        ]
+                    };
+
                     Operation {
                         name: format!(
                             "search_{}_by_{}",
@@ -158,21 +191,7 @@ pub fn convert_introspect_data(
                         } else {
                             ReturnType::Array
                         },
-                        args: indexed_columns
-                            .column_names
-                            .iter()
-                            .map(|col_name| {
-                                let col = regular_cols
-                                    .iter()
-                                    .find(|col| col.name.eq(col_name))
-                                    .unwrap();
-                                Arg {
-                                    name: col_name.to_owned(),
-                                    tpe: postgres_data_type_to_input(&col.datatype),
-                                    arg_type: ArgType::ColumnName,
-                                }
-                            })
-                            .collect_vec(),
+                        args: [base_args, pagination_args].concat(),
                     }
                 })
                 .collect_vec();
@@ -189,13 +208,7 @@ pub fn convert_introspect_data(
 
                                 Arg {
                                     name: pk.name.to_owned(),
-                                    tpe: match pk.datatype.as_str() {
-                                        "text" => GraphQLString { default: None },
-                                        "int" => GraphQLInteger { default: None },
-                                        "integer" => GraphQLInteger { default: None },
-                                        "uuid" => GraphQLID { default: None },
-                                        _ => GraphQLString { default: None },
-                                    },
+                                    tpe: postgres_data_type_to_input(&pk.datatype),
                                     arg_type: ArgType::ColumnName,
                                 }
                             })
