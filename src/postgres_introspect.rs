@@ -1,10 +1,15 @@
 use crate::postgres_introspect::PostgresFunctionReturn::{SetOfObject, SingleObject};
 use crate::InputType::{GraphQLID, GraphQLInteger, GraphQLString};
 use crate::{
-    ok, Arg, ArgType, Column, DatabaseFunction, DatabaseRelationship, DatabaseTable, Function,
+    Arg, ArgType, Column, DatabaseFunction, DatabaseRelationship, DatabaseTable, Function,
     FunctionArg, InputType, Operation, OperationType, PostgresIndexedColumns, PostgresTableColumm,
     PostgresTableReferences, PostgresTableRow, PostgresTableView, PrimaryKey, ReturnType,
     SelectableStuff, Table, TableUniqueConstraint,
+};
+use graphql_parser::query::Type::{ListType, NamedType, NonNullType};
+use graphql_parser::schema::Definition::TypeDefinition;
+use graphql_parser::schema::{
+    Definition, Document, Field, InputValue, ObjectType, SchemaDefinition,
 };
 use itertools::Itertools;
 use regex::Regex;
@@ -17,6 +22,92 @@ pub struct IntrospectionResult {
     pub relationships2: Vec<DatabaseRelationship>,
     pub functions: Vec<DatabaseFunction>,
     pub selectable_by_operation_name: HashMap<String, SelectableStuff>,
+}
+
+impl IntrospectionResult {
+    pub fn to_schema(&self) -> Document<String> {
+        let query_fields: Vec<Field<String>> = self
+            .tables
+            .iter()
+            .flat_map(|table| table.toplevel_ops.iter().map(move |op| (table, op)))
+            .map(|(table, op)| {
+                let arguments = op
+                    .args
+                    .iter()
+                    .map(|arg| {
+                        let value_type = match arg.tpe {
+                            InputType::GraphQLInteger { .. } => NamedType("Integer".to_string()),
+                            InputType::GraphQLString { .. } => NamedType("String".to_string()),
+                            InputType::GraphQLBoolean { .. } => NamedType("Bool".to_string()),
+                            InputType::GraphQLID { .. } => NamedType("ID".to_string()),
+                        };
+                        InputValue {
+                            position: Default::default(),
+                            description: None,
+                            name: arg.name.to_owned(),
+                            value_type,
+                            default_value: None,
+                            directives: vec![],
+                        }
+                    })
+                    .collect_vec();
+                let name = op.name.to_owned();
+                let field_type = match op.return_type {
+                    ReturnType::Object => NamedType(table.name.to_owned()),
+                    ReturnType::Array => ListType(Box::new(NonNullType(Box::new(NamedType(
+                        table.name.to_owned(),
+                    ))))),
+                };
+                Field {
+                    position: Default::default(),
+                    description: None,
+                    name,
+                    arguments,
+                    field_type,
+                    directives: vec![],
+                }
+            })
+            .collect_vec();
+
+        let table_types = self
+            .tables
+            .iter()
+            .map(|table| table.to_graphql_object(&self.relationships2))
+            .map(|tpe| {
+                Definition::TypeDefinition(graphql_parser::schema::TypeDefinition::Object(tpe))
+            })
+            .collect_vec();
+
+        let query_object = ObjectType {
+            position: Default::default(),
+            description: None,
+            name: "query".to_string(),
+            implements_interfaces: vec![],
+            directives: vec![],
+            fields: query_fields,
+        };
+
+        let query = graphql_parser::schema::TypeDefinition::Object(query_object);
+
+        let schema: SchemaDefinition<String> = SchemaDefinition {
+            position: Default::default(),
+            directives: vec![],
+            query: Some("query".to_string()),
+            mutation: None,
+            subscription: None,
+        };
+
+        let defs = [
+            table_types,
+            vec![
+                Definition::TypeDefinition(query),
+                Definition::SchemaDefinition(schema),
+            ],
+        ]
+        .concat();
+
+        Document { definitions: defs }
+    }
 }
 
 pub async fn fetch_introspection_data(
@@ -48,7 +139,7 @@ pub async fn fetch_introspection_data(
     ))
 }
 
-fn postgres_data_type_to_input(data_type: &str) -> InputType {
+pub fn postgres_data_type_to_input(data_type: &str) -> InputType {
     match data_type {
         "text" => GraphQLString { default: None },
         "int" => GraphQLInteger { default: None },
@@ -169,11 +260,18 @@ pub fn convert_introspect_data(
                         PostgresFunctionReturn::SetOfObject { .. } => ReturnType::Array,
                     };
 
+                    let return_type_optional = match function.return_type {
+                        PostgresFunctionReturn::Scalar => true,
+                        PostgresFunctionReturn::SingleObject { .. } => true, // TODO: Do we know?
+                        PostgresFunctionReturn::SetOfObject { .. } => false,
+                    };
+
                     Operation {
                         name: function.name.to_owned(),
                         return_type,
                         args: vec![],
                         operation_type: OperationType::Function,
+                        return_type_optional,
                     }
                 })
                 .collect_vec();
@@ -234,6 +332,7 @@ pub fn convert_introspect_data(
                         },
                         args: [base_args, pagination_args].concat(),
                         operation_type: OperationType::Table,
+                        return_type_optional: true,
                     }
                 })
                 .collect_vec();
@@ -256,6 +355,7 @@ pub fn convert_introspect_data(
                             })
                             .collect_vec(),
                         operation_type: OperationType::Table,
+                        return_type_optional: true,
                     },
                     Operation {
                         name: format!("list_{}", table.name),
@@ -273,13 +373,15 @@ pub fn convert_introspect_data(
                             },
                         ],
                         operation_type: OperationType::Table,
+                        return_type_optional: false,
                     },
-                    Operation {
-                        name: format!("search_{}", table.name),
-                        return_type: ReturnType::Array,
-                        args: vec![],
-                        operation_type: OperationType::Table,
-                    },
+                    // Operation {
+                    //     name: format!("search_{}", table.name),
+                    //     return_type: ReturnType::Array,
+                    //     args: vec![],
+                    //     operation_type: OperationType::Table,
+                    //     return_type_optional: false,
+                    // },
                 ];
 
                 [base, indexed_cols_ops, function_ops].concat()
@@ -788,148 +890,3 @@ WHERE       (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class 
         .fetch_all(pool)
         .await
 }
-
-const list_functions_sql: &str = r#"SELECT
-    "function_info".function_schema,
-    "function_info".function_name,
-    coalesce("function_info".info, '[]'::json) AS info
-FROM (
-         SELECT
-             function_name,
-             function_schema,
-             -- This field corresponds to the 'RawFunctionInfo' Haskell type
-             json_agg(
-                     json_build_object(
-                             'oid', "pg_function".function_oid,
-                             'description', "pg_function".description,
-                             'has_variadic', "pg_function".has_variadic,
-                             'function_type', "pg_function".function_type,
-                             'return_type_schema', "pg_function".return_type_schema,
-                             'return_type_name', "pg_function".return_type_name,
-                             'return_type_type', "pg_function".return_type_type,
-                             'returns_set', "pg_function".returns_set,
-                             'input_arg_types', "pg_function".input_arg_types,
-                             'input_arg_names', "pg_function".input_arg_names,
-                             'default_args', "pg_function".default_args,
-                             'returns_table', "pg_function".returns_table
-                         )
-                 ) AS info
-         FROM (
-                  -- Necessary metadata from Postgres
-                  SELECT
-                      "function".function_name,
-                      "function".function_schema,
-                      pd.description,
-
-                      CASE
-                          WHEN ("function".provariadic = (0) :: oid) THEN false
-                          ELSE true
-                          END AS has_variadic,
-
-                      CASE
-                          WHEN (
-                                  ("function".provolatile) :: text = ('i' :: character(1)) :: text
-                              ) THEN 'IMMUTABLE' :: text
-                          WHEN (
-                                  ("function".provolatile) :: text = ('s' :: character(1)) :: text
-                              ) THEN 'STABLE' :: text
-                          WHEN (
-                                  ("function".provolatile) :: text = ('v' :: character(1)) :: text
-                              ) THEN 'VOLATILE' :: text
-                          ELSE NULL :: text
-                          END AS function_type,
-
-pg_get_functiondef("function".function_oid) AS function_definition,
-
-	        rtn.nspname::text as return_type_schema,
-	        rt.typname::text as return_type_name,
-	        rt.typtype::text as return_type_type,
-	        "function".proretset AS returns_set,
-	        ( SELECT
-	            COALESCE(json_agg(
-	              json_build_object('schema', q."schema",
-	                                'name', q."name",
-	                                'type', q."type"
-	                               )
-	            ), '[]')
-	          FROM
-	            (
-	              SELECT
-	                pt.typname AS "name",
-	                pns.nspname AS "schema",
-	                pt.typtype AS "type",
-	                pat.ordinality
-	              FROM
-	                unnest(
-	                  COALESCE("function".proallargtypes, ("function".proargtypes) :: oid [])
-	                ) WITH ORDINALITY pat(oid, ordinality)
-	                LEFT JOIN pg_type pt ON ((pt.oid = pat.oid))
-	                LEFT JOIN pg_namespace pns ON (pt.typnamespace = pns.oid)
-	              ORDER BY pat.ordinality ASC
-	            ) q
-	         ) AS input_arg_types,
-	        to_json(COALESCE("function".proargnames, ARRAY [] :: text [])) AS input_arg_names,
-	        "function".pronargdefaults AS default_args,
-	        "function".function_oid::integer AS function_oid,
-	        (exists(
-	          SELECT
-	            1
-	            FROM
-	              information_schema.tables
-	            WHERE
-	              table_schema = rtn.nspname::text
-	              AND table_name = rt.typname::text
-	          ) OR
-	         exists(
-	           SELECT
-	             1
-	             FROM
-	                 pg_matviews
-	           WHERE
-	                schemaname = rtn.nspname::text
-	            AND matviewname = rt.typname::text
-	          )
-	        ) AS returns_table
-
-FROM
-	        (SELECT   p.oid AS function_oid,
-	                   p.*,
-	                   p.proname::text AS function_name,
-	                   pn.nspname::text AS function_schema
-	              FROM pg_proc p
-	              JOIN pg_namespace pn ON (pn.oid = p.pronamespace)) as "function"
-
-	        JOIN pg_type rt ON (rt.oid = "function".prorettype)
-	        JOIN pg_namespace rtn ON (rtn.oid = rt.typnamespace)
-	        LEFT JOIN pg_description pd ON "function".function_oid = pd.objoid
-	      WHERE
-	        -- Do not fetch some default functions in public schema
-	        "function".function_name NOT LIKE 'pgp_%'
-	        AND "function".function_name NOT IN
-	                          ( 'armor'
-	                          , 'crypt'
-	                          , 'dearmor'
-	                          , 'decrypt'
-	                          , 'decrypt_iv'
-	                          , 'digest'
-	                          , 'encrypt'
-	                          , 'encrypt_iv'
-	                          , 'gen_random_bytes'
-	                          , 'gen_random_uuid'
-	                          , 'gen_salt'
-	                          , 'hmac'
-	                          )
-	        AND "function".function_schema NOT LIKE 'pg_%'
-	        AND "function".function_schema NOT IN ('information_schema', 'hdb_catalog')
-	        AND (NOT EXISTS (
-	                SELECT
-	                  1
-	                FROM
-	                  pg_aggregate
-	                WHERE
-	                  ((pg_aggregate.aggfnoid) :: oid = "function".function_oid)
-	              )
-	          )
-	    ) AS "pg_function"
-	    GROUP BY "pg_function".function_schema, "pg_function".function_name
-	  ) "function_info""#;

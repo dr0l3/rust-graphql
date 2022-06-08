@@ -5,16 +5,18 @@ extern crate dotenv;
 extern crate futures_util;
 
 use crate::futures_util::StreamExt;
-use crate::postgres_introspect::IntrospectionResult;
+use crate::postgres_introspect::{postgres_data_type_to_input, IntrospectionResult};
 use crate::SelectableStuff::{Function, Table};
 use crate::SqlQuery::FunctionSelection;
 use futures::future::*;
 use graphql_parser::query::{
-    Definition, Document, Field, OperationDefinition, Query, Selection, SelectionSet,
+    Definition, Document, Field, OperationDefinition, Query, Selection, SelectionSet, Type,
 };
-use itertools::Itertools;
+use graphql_parser::schema::Value;
+use itertools::{concat, Itertools};
 use postgres_introspect::{convert_introspect_data, fetch_introspection_data};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
+use std::collections::BTreeMap;
 use std::fmt::{format, Display, Formatter};
 use std::sync::{Arc, Mutex};
 
@@ -24,6 +26,56 @@ pub struct DatabaseTable {
     pub columns: Vec<Column>,
     pub primary_keys: Vec<PrimaryKey>,
     pub toplevel_ops: Vec<Operation>,
+}
+
+impl DatabaseTable {
+    fn to_graphql_object(
+        &self,
+        relationships: &Vec<DatabaseRelationship>,
+    ) -> graphql_parser::schema::ObjectType<String> {
+        let column_fields = self
+            .get_all_columns()
+            .map(|col| col.to_graphql_field())
+            .collect_vec();
+        let outbound_relationship_fields = relationships
+            .iter()
+            .filter(|relationship| relationship.table_name.eq(&self.name))
+            .map(|relationship| {
+                let field_type: Type<String> = match relationship.return_type {
+                    ReturnType::Object => {
+                        Type::NamedType(String::from(relationship.table_name.to_owned()))
+                    }
+                    ReturnType::Array => Type::ListType(Box::new(Type::NonNullType(Box::new(
+                        Type::NamedType(String::from(relationship.table_name.to_owned())),
+                    )))),
+                };
+
+                graphql_parser::schema::Field {
+                    position: Default::default(),
+                    description: None,
+                    name: relationship.field_name.to_owned(),
+                    arguments: vec![],
+                    field_type: if relationship.column_optional {
+                        Type::NonNullType(Box::new(field_type))
+                    } else {
+                        field_type
+                    },
+                    directives: vec![],
+                }
+            })
+            .collect_vec();
+
+        let fields = [column_fields, outbound_relationship_fields].concat();
+
+        graphql_parser::schema::ObjectType {
+            position: Default::default(),
+            description: None,
+            name: self.name.to_owned(),
+            implements_interfaces: vec![],
+            directives: vec![],
+            fields,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +103,7 @@ pub struct Operation {
     pub return_type: ReturnType,
     pub args: Vec<Arg>,
     pub operation_type: OperationType,
+    pub return_type_optional: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -99,6 +152,32 @@ pub struct Column {
     pub datatype: String,
     pub required: bool,
     pub unique: bool,
+}
+
+impl Column {
+    fn to_graphql_field(&self) -> graphql_parser::schema::Field<String> {
+        let field_type = match postgres_data_type_to_input(&self.datatype) {
+            InputType::GraphQLInteger { .. } => Type::NamedType(String::from("Integer")),
+            InputType::GraphQLString { .. } => Type::NamedType(String::from("String")),
+            InputType::GraphQLBoolean { .. } => Type::NamedType(String::from("Boolean")),
+            InputType::GraphQLID { .. } => Type::NamedType(String::from("ID")),
+        };
+
+        let type_with_required = if self.required {
+            Type::NonNullType(Box::new(field_type))
+        } else {
+            field_type
+        };
+
+        graphql_parser::schema::Field {
+            position: Default::default(),
+            description: None,
+            name: self.name.to_owned(),
+            arguments: vec![],
+            field_type: type_with_required,
+            directives: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -884,7 +963,7 @@ mod tests {
     use derivative::*;
     use futures::future::{join_all, try_join_all};
     use futures::{join, select, try_join};
-    use graphql_parser::parse_query;
+    use graphql_parser::{parse_query, Style};
     use sqlformat::{format, FormatOptions, QueryParams};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -895,6 +974,7 @@ mod tests {
     use crate::PrimaryKey;
     use dockertest::waitfor::{MessageSource, MessageWait};
     use dockertest::{Composition, DockerTest, Source};
+    use graphql_parser::schema::Document;
     use itertools::Itertools;
     use sqlx::query::Query;
     use sqlx::{postgres::PgPoolOptions, Error, Pool, Postgres, Row};
@@ -986,6 +1066,46 @@ mod tests {
         let res: (serde_json::Value,) = sqlx::query_as(&executable_sql).fetch_one(&pool).await?;
         pg.stop();
         Ok(res.0)
+    }
+
+    async fn base_test_schema(sql: Vec<String>) -> Result<Document<'static, String>, Error> {
+        let docker = clients::Cli::default();
+        let pg = docker.run(DockerPostgres {
+            env_vars: HashMap::from([("POSTGRES_PASSWORD".to_owned(), "postgres".to_owned())]),
+            tag: "14".to_owned(),
+        });
+
+        let port = pg.get_host_port(5432);
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&format!(
+                "postgres://postgres:postgres@0.0.0.0:{}/postgres",
+                port
+            ))
+            .await?;
+
+        let init = sql
+            .iter()
+            .map(|init_sql| sqlx::query(init_sql).execute(&pool))
+            .collect_vec();
+
+        for future in init {
+            future.await?;
+        }
+
+        //let init_res = try_join_all(init).await?;
+        //println!("{:#?}", init_res);
+
+        let (tables, constraints, cols, references, indexes, functions) =
+            fetch_introspection_data(&pool).await?;
+        let introspection =
+            convert_introspect_data(tables, constraints, cols, references, indexes, functions);
+
+        let schema = introspection.to_schema().into_static();
+
+        pg.stop();
+        Ok(schema)
     }
 
     #[tokio::test]
@@ -1634,6 +1754,39 @@ mod tests {
 
         let actual = base_test(init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"a": 1, "b": "rune","test2":[{"c": 1, "d": 1}]}, {"a": 2, "b": "rune","test2":[{"c": 2, "d": 2}]}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simple_table_schema() -> Result<(), Error> {
+        let init_sql = vec![String::from(
+            "create table test(a int primary key, b text);",
+        )];
+
+        let doc = base_test_schema(init_sql).await?;
+        let actual = doc.format(&Style::default());
+
+        let expected = "type test {\n  b: String\n  a: Integer!\n}\n\ntype query {\n  get_test_by_id(a: Integer): test\n  list_test(limit: Integer, offset: Integer): [test!]\n}\n\nschema {\n  query: query\n}\n";
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_table_schema() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text);"),
+            String::from("create table test2(c int primary key, d int references test(a));"),
+        ];
+
+        let doc = base_test_schema(init_sql).await?;
+        let actual = doc.format(&Style::default());
+
+        let expected = "type test {\n  b: String\n  a: Integer!\n  test2: [test!]\n}\n\ntype test2 {\n  d: Integer\n  c: Integer!\n  test: test2!\n}\n\ntype query {\n  get_test_by_id(a: Integer): test\n  list_test(limit: Integer, offset: Integer): [test!]\n  get_test2_by_id(c: Integer): test2\n  list_test2(limit: Integer, offset: Integer): [test2!]\n}\n\nschema {\n  query: query\n}\n";
 
         assert_eq!(expected, actual);
 
