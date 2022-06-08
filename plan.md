@@ -14,6 +14,7 @@
 # Non working stuff
 - Fragments
 - Functions
+- GraphQL schema introspection
 - Other operations
   - Update
   - Insert
@@ -30,7 +31,6 @@
     - Hide
     - Rename
     - Read only
-  - Inflection (plural)
-- GraphQL schema introspection
-- Inflection
 - Federation
+- fuzzy search operations
+  - if index covers field

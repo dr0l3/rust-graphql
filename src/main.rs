@@ -4,6 +4,11 @@ extern crate core;
 extern crate dotenv;
 
 use crate::futures_util::StreamExt;
+use crate::indexmap::IndexMap;
+use crate::postgres_introspect::IntrospectionResult;
+use crate::SelectableStuff::{Function, Table};
+use crate::SqlQuery::FunctionSelection;
+use async_graphql::registry::{MetaType, MetaTypeId, Registry};
 use async_graphql::{
     parser::parse_query,
     parser::types::{ExecutableDocument, Field, OperationDefinition, Selection},
@@ -25,10 +30,30 @@ pub struct DatabaseTable {
 }
 
 #[derive(Debug, Clone)]
+pub struct DatabaseFunction {
+    pub name: String,
+    pub table: DatabaseTable,
+    pub args: Vec<FunctionArg>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionArg {
+    pub name: String,
+    pub arg_type: InputType,
+}
+
+#[derive(Debug, Clone)]
+pub enum OperationType {
+    Table,
+    Function,
+}
+
+#[derive(Debug, Clone)]
 pub struct Operation {
     pub name: String,
     pub return_type: ReturnType,
     pub args: Vec<Arg>,
+    pub operation_type: OperationType,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -37,6 +62,17 @@ pub enum InputType {
     GraphQLString { default: Option<String> },
     GraphQLBoolean { default: Option<bool> },
     GraphQLID { default: Option<String> },
+}
+
+impl InputType {
+    fn is_quoted(&self) -> bool {
+        match self {
+            InputType::GraphQLInteger { .. } => false,
+            InputType::GraphQLString { .. } => true,
+            InputType::GraphQLBoolean { .. } => false,
+            InputType::GraphQLID { .. } => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -130,6 +166,7 @@ pub struct PostgresIndexedColumns {
     index_name: String,
     column_names: Vec<String>,
     schema_name: String,
+    index_def: String,
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
@@ -143,15 +180,18 @@ struct TableUniqueConstraint {
 async fn main() -> Result<(), String> {
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect("postgres://postgres:postgres@0.0.0.0:5439/dixa")
+        .connect("postgres://postgres:postgres@0.0.0.0:5439/postgres")
         .map_err(|err| err.to_string())
         .await?;
-    let (tables, constraints, columns, references, indexes) = fetch_introspection_data(&pool)
-        .map_err(|err| err.to_string())
-        .await?;
-    let results = convert_introspect_data(tables, constraints, columns, references, indexes);
+    let (tables, constraints, columns, references, indexes, functions) =
+        fetch_introspection_data(&pool)
+            .map_err(|err| err.to_string())
+            .await?;
 
-    println!("{:#?}", results);
+    println!("{:#?}", functions);
+
+    let results =
+        convert_introspect_data(tables, constraints, columns, references, indexes, functions);
 
     Ok(())
 }
@@ -162,20 +202,48 @@ struct TablePagination {
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct TableSelection {
-    table_name: String,
-    column_names: Vec<String>,
-    left_joins: Vec<LeftJoin>,
-    where_clauses: Vec<WhereClause>,
-    pagination: Option<TablePagination>,
-    return_type: ReturnType,
-    field_name: String,
-    path: String,
+struct FunctionSelectionArgument {
+    value: String,
+    quoted: bool,
+}
+
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum SqlQuery {
+    TableSelection {
+        table_name: String,
+        column_names: Vec<String>,
+        left_joins: Vec<LeftJoin>,
+        where_clauses: Vec<WhereClause>,
+        pagination: Option<TablePagination>,
+        return_type: ReturnType,
+        field_name: String,
+        path: String,
+    },
+    FunctionSelection {
+        function_name: String,
+        column_names: Vec<String>,
+        left_joins: Vec<LeftJoin>,
+        where_clauses: Vec<WhereClause>,
+        pagination: Option<TablePagination>,
+        return_type: ReturnType,
+        field_name: String,
+        path: String,
+        arguments: Vec<FunctionSelectionArgument>,
+    },
+}
+
+trait Selectable {
+    fn name() -> String;
+    fn column_name() -> Vec<String>;
+    fn left_joins() -> Vec<LeftJoin>;
+    fn return_type() -> ReturnType;
+    fn path() -> String;
+    fn field_name() -> String;
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct LeftJoin {
-    right_table: TableSelection,
+    right_table: SqlQuery,
     join_conditions: Vec<JoinCondition>,
 }
 
@@ -198,10 +266,59 @@ pub enum ReturnType {
     Array,
 }
 
-impl TableSelection {
+impl SqlQuery {
+    fn get_where_clauses(&self) -> &Vec<WhereClause> {
+        match self {
+            SqlQuery::TableSelection { where_clauses, .. } => where_clauses,
+            SqlQuery::FunctionSelection { where_clauses, .. } => where_clauses,
+        }
+    }
+
+    fn get_pagination(&self) -> &Option<TablePagination> {
+        match self {
+            SqlQuery::TableSelection { pagination, .. } => pagination,
+            SqlQuery::FunctionSelection { pagination, .. } => pagination,
+        }
+    }
+
+    fn get_column_names(&self) -> &Vec<String> {
+        match self {
+            SqlQuery::TableSelection { column_names, .. } => column_names,
+            SqlQuery::FunctionSelection { column_names, .. } => column_names,
+        }
+    }
+
+    fn get_return_type(&self) -> &ReturnType {
+        match self {
+            SqlQuery::TableSelection { return_type, .. } => return_type,
+            SqlQuery::FunctionSelection { return_type, .. } => return_type,
+        }
+    }
+
+    fn get_left_joins(&self) -> &Vec<LeftJoin> {
+        match self {
+            SqlQuery::TableSelection { left_joins, .. } => left_joins,
+            SqlQuery::FunctionSelection { left_joins, .. } => left_joins,
+        }
+    }
+
+    fn get_field_name(&self) -> &String {
+        match self {
+            SqlQuery::TableSelection { field_name, .. } => field_name,
+            SqlQuery::FunctionSelection { field_name, .. } => field_name,
+        }
+    }
+
+    fn get_path(&self) -> &String {
+        match self {
+            SqlQuery::TableSelection { path, .. } => path,
+            SqlQuery::FunctionSelection { path, .. } => path,
+        }
+    }
+
     fn to_data_select_sql(&self) -> String {
         let where_clause = self
-            .where_clauses
+            .get_where_clauses()
             .iter()
             .map(
                 |WhereClause {
@@ -226,15 +343,33 @@ impl TableSelection {
         };
 
         let pagination = self
-            .pagination
+            .get_pagination()
             .as_ref()
             .map(|pag| format!("limit {} offset {}", pag.limit, pag.offset))
             .unwrap_or(String::from(""));
 
-        format!(
-            "select * from {} {} {}",
-            self.table_name, where_string, pagination
-        )
+        let from = match self {
+            SqlQuery::TableSelection { table_name, .. } => table_name.to_owned(),
+            SqlQuery::FunctionSelection {
+                function_name,
+                arguments,
+                ..
+            } => {
+                let arg_string = arguments
+                    .iter()
+                    .map(|arg| {
+                        if arg.quoted {
+                            format!("'{}'", arg.value.trim_matches('"'))
+                        } else {
+                            arg.value.to_owned()
+                        }
+                    })
+                    .collect_vec()
+                    .join(",");
+                format!("{}({})", function_name, arg_string)
+            }
+        };
+        format!("select * from {} {} {}", from, where_string, pagination)
     }
 
     /*
@@ -254,22 +389,31 @@ impl TableSelection {
 
     // Shared for both
     fn to_json_sql(&self) -> String {
-        let cols = self
-            .column_names
-            .iter()
-            .map(|col_name| format!(r#""{}_data"."{}" as "{}""#, self.path, col_name, col_name));
+        let cols = match self {
+            SqlQuery::TableSelection { column_names, .. } => column_names,
+            SqlQuery::FunctionSelection { column_names, .. } => column_names,
+        }
+        .iter()
+        .map(|col_name| {
+            let path = self.get_path();
+            format!(r#""{}_data"."{}" as "{}""#, path, col_name, col_name)
+        });
         let data_select = self.to_data_select_sql();
 
-        let default = match self.return_type {
+        let default = match self.get_return_type() {
             ReturnType::Object => "'null'",
             ReturnType::Array => "'[]'",
         };
 
         let joins = self
-            .left_joins
+            .get_left_joins()
             .iter()
             .map(|LeftJoin { right_table, .. }| {
                 let nested = right_table.to_json_sql();
+                let right_path = match right_table {
+                    SqlQuery::TableSelection { path, .. } => path,
+                    SqlQuery::FunctionSelection { path, .. } => path,
+                };
                 format!(
                     r#"
             LEFT OUTER JOIN LATERAL (
@@ -277,31 +421,34 @@ impl TableSelection {
             ) as "{path}" on ('true')
             "#,
                     nested = nested,
-                    path = right_table.path
+                    path = right_path
                 )
             })
             .join("\n");
 
-        let join_cols = self.left_joins.iter().map(|LeftJoin { right_table, .. }| {
-            format!(
-                r#""{path}"."{col_name}" as "{out_name}""#,
-                path = right_table.path,
-                col_name = right_table.field_name,
-                out_name = right_table.field_name
-            )
-        });
+        let join_cols = self
+            .get_left_joins()
+            .iter()
+            .map(|LeftJoin { right_table, .. }| {
+                format!(
+                    r#""{path}"."{col_name}" as "{out_name}""#,
+                    path = right_table.get_path(),
+                    col_name = right_table.get_field_name(),
+                    out_name = right_table.get_field_name()
+                )
+            });
 
         let all_cols = cols.chain(join_cols).collect_vec().join(",\n");
-        let selector = match self.return_type {
+        let selector = match self.get_return_type() {
             ReturnType::Object => {
-                format!(r#"(json_agg("{path}") -> 0)"#, path = self.path)
+                format!(r#"(json_agg("{path}") -> 0)"#, path = self.get_path())
             }
             ReturnType::Array => {
-                format!(r#"(json_agg("{path}"))"#, path = self.path)
+                format!(r#"(json_agg("{path}"))"#, path = self.get_path())
             }
         };
 
-        println!("{:?} -> {}", self.return_type, selector);
+        println!("{:?} -> {}", self.get_return_type(), selector);
 
         format!(
             r#"
@@ -314,12 +461,12 @@ impl TableSelection {
 
         ) as "{path}"
         "#,
-            path = self.path,
+            path = self.get_path(),
             default = default,
             cols = all_cols,
             data_select = data_select,
             joins = joins,
-            field_name = self.field_name,
+            field_name = self.get_field_name(),
             selector = selector
         )
     }
@@ -341,26 +488,57 @@ enum SearchPlace {
     },
 }
 
+#[derive(Debug, Clone)]
+pub enum SelectableStuff {
+    Table { table: DatabaseTable },
+    Function { function: DatabaseFunction },
+}
+
+impl SelectableStuff {
+    fn get_all_columns(&self) -> impl Iterator<Item = &Column> {
+        match self {
+            SelectableStuff::Table { table } => table.get_all_columns(),
+            SelectableStuff::Function { function } => function.table.get_all_columns(),
+        }
+    }
+    fn get_table_name(&self) -> String {
+        match self {
+            SelectableStuff::Table { table, .. } => table.name.to_owned(),
+            SelectableStuff::Function { function, .. } => function.table.name.to_owned(),
+        }
+    }
+}
+
 fn field_to_table_selection(
     field: &Field,
-    tables: &Vec<DatabaseTable>,
+    introspection: &IntrospectionResult,
     search_place: &SearchPlace,
-    relationships2: &Vec<DatabaseRelationship>,
     path: String,
-) -> TableSelection {
+) -> SqlQuery {
+    // TODO: Start here. Need to support functions as well as tables
+
+    println!(
+        "field_name: {} ops: {:#?}",
+        field.response_key().node.to_string(),
+        introspection.selectable_by_operation_name
+    );
+
+    let selectable = introspection
+        .selectable_by_operation_name
+        .get(&field.response_key().node.to_string());
+
     let table = match search_place {
-        SearchPlace::TopLevel => tables.iter().find(|table| {
-            table
-                .toplevel_ops
-                .iter()
-                .map(|op| &op.name)
-                .contains(&field.response_key().node.to_string())
-        }),
-        SearchPlace::Relationship { relationship, .. } => tables
+        SearchPlace::TopLevel => match selectable.expect("unable to find selectable") {
+            Table { table } => table,
+            Function { function } => &function.table,
+        },
+
+        SearchPlace::Relationship { relationship, .. } => introspection
+            .tables
             .iter()
-            .find(|table| table.name.contains(&relationship.target_table_name)),
-    }
-    .expect("No table found");
+            .find(|table| table.name.contains(&relationship.target_table_name))
+            .expect("Unable to find relationship"),
+    };
 
     let columns: Vec<String> = field
         .selection_set
@@ -386,9 +564,10 @@ fn field_to_table_selection(
         .map(|Positioned { node, .. }| inner(node))
         .filter(|field| field.selection_set.node.items.len() > 0)
         .map(|field| {
-            println!("wutwutwut {} {}", table.name, field.name.node.to_string());
+            // println!("wutwutwut {} {}", table.name, field.name.node.to_string());
 
-            let relationship = relationships2
+            let relationship = introspection
+                .relationships2
                 .iter()
                 .find(|relationship| {
                     relationship.table_name.eq(&table.name)
@@ -417,12 +596,11 @@ fn field_to_table_selection(
             (
                 field_to_table_selection(
                     field,
-                    tables,
+                    introspection,
                     &SearchPlace::Relationship {
                         relationship: relationship_param,
                         path: path.to_owned(),
                     },
-                    relationships2,
                     updated_path,
                 ),
                 relationship,
@@ -582,23 +760,67 @@ fn field_to_table_selection(
         SearchPlace::Relationship { relationship, .. } => relationship.return_type,
     };
 
-    TableSelection {
-        left_joins: selected_joins,
-        where_clauses,
-        column_names: columns,
-        table_name: table.name.to_owned(),
-        return_type,
-        pagination,
-        field_name: field.name.node.to_string(),
-        path,
+    match search_place {
+        SearchPlace::TopLevel => match selectable.expect("Unable to find selectable") {
+            Table { table } => SqlQuery::TableSelection {
+                left_joins: selected_joins,
+                where_clauses,
+                column_names: columns,
+                table_name: table.name.to_owned(),
+                return_type,
+                pagination,
+                field_name: field.name.node.to_string(),
+                path,
+            },
+            Function { function } => {
+                let arguments = function
+                    .args
+                    .iter()
+                    .map(|arg| {
+                        println!("{:#?}", arg);
+                        let arg_value = field
+                            .arguments
+                            .iter()
+                            .find(|(field_arg, _)| field_arg.node.eq(&arg.name))
+                            .map(|(_, value)| value.node.to_string())
+                            .expect("Unable to find argument");
+                        FunctionSelectionArgument {
+                            value: arg_value,
+                            quoted: arg.arg_type.is_quoted(),
+                        }
+                    })
+                    .collect_vec();
+
+                FunctionSelection {
+                    function_name: function.name.to_string(),
+                    column_names: columns,
+                    left_joins: selected_joins,
+                    where_clauses,
+                    pagination,
+                    return_type,
+                    field_name: field.name.node.to_string(),
+                    path,
+                    arguments,
+                }
+            }
+        },
+        SearchPlace::Relationship { .. } => SqlQuery::TableSelection {
+            left_joins: selected_joins,
+            where_clauses,
+            column_names: columns,
+            table_name: table.name.to_owned(),
+            return_type,
+            pagination,
+            field_name: field.name.node.to_string(),
+            path,
+        },
     }
 }
 
 fn to_intermediate(
     query: &ExecutableDocument,
-    tables: &Vec<DatabaseTable>,
-    relationships2: &Vec<DatabaseRelationship>,
-) -> Vec<TableSelection> {
+    introspection: &IntrospectionResult,
+) -> Vec<SqlQuery> {
     let ops = query
         .operations
         .iter()
@@ -611,9 +833,8 @@ fn to_intermediate(
                 |Positioned { node, .. }| match node {
                     Selection::Field(Positioned { node, .. }) => field_to_table_selection(
                         &node,
-                        tables,
+                        introspection,
                         &SearchPlace::TopLevel,
-                        relationships2,
                         "root".to_string(),
                     ),
                     Selection::FragmentSpread(_) => todo!(),
@@ -629,7 +850,7 @@ mod tests {
     use crate::{
         convert_introspect_data, fetch_introspection_data, select, to_intermediate, Arg,
         DatabaseRelationship, InputType, JoinCondition, LeftJoin, Operation, ReturnType,
-        SearchPlace, TableSelection, TryFutureExt, WhereClause,
+        SearchPlace, SqlQuery, TryFutureExt, WhereClause,
     };
     use derivative::*;
     use futures::future::{join_all, try_join_all};
@@ -709,14 +930,14 @@ mod tests {
         //let init_res = try_join_all(init).await?;
         //println!("{:#?}", init_res);
 
-        let (tables, constraints, cols, references, indexes) =
+        let (tables, constraints, cols, references, indexes, functions) =
             fetch_introspection_data(&pool).await?;
-        let introspection = convert_introspect_data(tables, constraints, cols, references, indexes);
+        let introspection =
+            convert_introspect_data(tables, constraints, cols, references, indexes, functions);
 
         println!("{:#?}", introspection);
         let query = parse_query(query).unwrap();
-        let intermediate =
-            to_intermediate(&query, &introspection.tables, &introspection.relationships2);
+        let intermediate = to_intermediate(&query, &introspection);
 
         println!("{:#?}", intermediate);
 
@@ -1245,6 +1466,145 @@ mod tests {
 
         let actual = base_test(init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"a": 1, "b": "rune"}, {"a": 2, "b": "rune"}, {"a": 3, "b": "rune"}, {"a": 4, "b": "rune"}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simple_function_get_all() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a uuid primary key, b text)"),
+            String::from("create function test_function() returns setof test as $$ select * from test $$ language sql stable"),
+            String::from("insert into test values('1ea0f505-b0e6-4a97-881e-a105fd580998', 'rune')"),
+            String::from(
+                "insert into test values('78a17f38-91fd-48be-a985-3342ab5f65c5', 'rune2')",
+            ),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                test_function{
+                    a
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!([{"a": "1ea0f505-b0e6-4a97-881e-a105fd580998", "b": "rune"}, {"a": "78a17f38-91fd-48be-a985-3342ab5f65c5", "b": "rune2"}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_function_source() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text);"),
+            String::from("create function test_function() returns setof test as $$ select * from test $$ language sql stable"),
+            String::from("insert into test values(1, 'rune');"),
+            String::from("insert into test values(2, 'rune2')"),
+            String::from("create table test2(c int primary key, d int references test(a));"),
+            String::from("insert into test2 values(1, 1);"),
+            String::from("insert into test2 values(2, 2);"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                test_function {
+                    a
+                    b
+                    test2 {
+                        c
+                        d
+                    }
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!([{"a": 1, "b": "rune","test2":[{"c": 1, "d": 1}]}, {"a": 2, "b": "rune2","test2":[{"c": 2, "d": 2}]}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_function_source_with_string_argument() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text);"),
+            String::from("create function test_function(b_arg text) returns setof test as $$ select * from test where b = b_arg $$ language sql stable"),
+            String::from("insert into test values(1, 'rune');"),
+            String::from("insert into test values(2, 'rune')"),
+            String::from("insert into test values(3, 'rune3')"),
+            String::from("create table test2(c int primary key, d int references test(a));"),
+            String::from("insert into test2 values(1, 1);"),
+            String::from("insert into test2 values(2, 2);"),
+            String::from("insert into test2 values(3, 3);"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                test_function(b_arg: "rune") {
+                    a
+                    b
+                    test2 {
+                        c
+                        d
+                    }
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!([{"a": 1, "b": "rune","test2":[{"c": 1, "d": 1}]}, {"a": 2, "b": "rune","test2":[{"c": 2, "d": 2}]}]);
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_function_source_with_numeric_argument() -> Result<(), Error> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text);"),
+            String::from("create function test_function(l_arg integer) returns setof test as $$ select * from test limit l_arg $$ language sql stable"),
+            String::from("insert into test values(1, 'rune');"),
+            String::from("insert into test values(2, 'rune')"),
+            String::from("insert into test values(3, 'rune3')"),
+            String::from("create table test2(c int primary key, d int references test(a));"),
+            String::from("insert into test2 values(1, 1);"),
+            String::from("insert into test2 values(2, 2);"),
+            String::from("insert into test2 values(3, 3);"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                test_function(l_arg: 2) {
+                    a
+                    b
+                    test2 {
+                        c
+                        d
+                    }
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(init_sql, graphql_query).await?;
+        let expected = serde_json::json!([{"a": 1, "b": "rune","test2":[{"c": 1, "d": 1}]}, {"a": 2, "b": "rune","test2":[{"c": 2, "d": 2}]}]);
 
         assert_eq!(expected, actual);
 

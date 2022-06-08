@@ -1,3 +1,17 @@
+# General idea
+
+Three set of entities
+
+- Structs representing rows returned from Postgres
+- Structs representing the API found in postgres
+- Structs representing the result of transpiling a query to sql
+  - Rendering this struct generates the sql
+
+Important functions
+
+- `fn introspect_postgres(...) -> IntrospectionResult`
+- `fn to_intermediate(api: IntrospectionResult, request: GraphQLRequest) -> SqlQuery`
+
 # Single table
 
 A table of the form 
@@ -130,3 +144,31 @@ type Query {
 ## Filtering
 
 Should this be a separate endpoint or just the listing one?
+
+# Indexes
+
+So far we have just added the ability to search by value when there is an index backing the operation.
+
+It would be nice to generate special operations if the index backing the column is s special index like
+- pg_trgm
+
+# Functions
+
+In essence we only care about the following things 
+
+- Parameters
+  - type (inout vs in)
+  - type (string vs int)
+- output
+  - type (string vs int)
+- stability classifier (immutable, stable and volatile)
+
+It is not possible to do predicate pushdown into functions. 
+
+## Features
+
+1. Support only functions with
+    - Exclusively in parameters
+    - immutable and stable classifiers
+    - returns setof or stuff
+

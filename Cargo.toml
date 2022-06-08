@@ -20,6 +20,8 @@ sqlformat = "0.2.0"
 dockertest = "0.3.0"
 testcontainers = "0.13.0"
 derivative = "2.2.0"
+regex = "1"
+
 
 [toolchain]
 channel = "nightly"

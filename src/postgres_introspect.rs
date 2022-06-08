@@ -1,18 +1,22 @@
+use crate::postgres_introspect::PostgresFunctionReturn::{SetOfObject, SingleObject};
 use crate::InputType::{GraphQLID, GraphQLInteger, GraphQLString};
 use crate::{
-    ok, Arg, ArgType, Column, DatabaseRelationship, DatabaseTable, InputType, Operation,
-    PostgresIndexedColumns, PostgresTableColumm, PostgresTableReferences, PostgresTableRow,
-    PostgresTableView, PrimaryKey, ReturnType, TableUniqueConstraint,
+    ok, Arg, ArgType, Column, DatabaseFunction, DatabaseRelationship, DatabaseTable, Function,
+    FunctionArg, InputType, Operation, OperationType, PostgresIndexedColumns, PostgresTableColumm,
+    PostgresTableReferences, PostgresTableRow, PostgresTableView, PrimaryKey, ReturnType,
+    SelectableStuff, Table, TableUniqueConstraint,
 };
 use itertools::Itertools;
-use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
-use std::borrow::Borrow;
-use std::ops::Deref;
+use regex::Regex;
+use sqlx::{Pool, Postgres};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct IntrospectionResult {
     pub tables: Vec<DatabaseTable>,
     pub relationships2: Vec<DatabaseRelationship>,
+    pub functions: Vec<DatabaseFunction>,
+    pub selectable_by_operation_name: HashMap<String, SelectableStuff>,
 }
 
 pub async fn fetch_introspection_data(
@@ -24,6 +28,7 @@ pub async fn fetch_introspection_data(
         Vec<PostgresTableColumm>,
         Vec<PostgresTableReferences>,
         Vec<PostgresIndexedColumns>,
+        Vec<PostgresFunction>,
     ),
     sqlx::Error,
 > {
@@ -32,7 +37,15 @@ pub async fn fetch_introspection_data(
     let columns = get_all_columns(pool).await?;
     let references = get_all_references(pool).await?;
     let indexes = get_indexes(pool).await?;
-    Ok((pg_tables, constraints, columns, references, indexes))
+    let functions = get_functions(pool).await?;
+    Ok((
+        pg_tables,
+        constraints,
+        columns,
+        references,
+        indexes,
+        functions,
+    ))
 }
 
 fn postgres_data_type_to_input(data_type: &str) -> InputType {
@@ -51,6 +64,7 @@ pub fn convert_introspect_data(
     columns: Vec<PostgresTableColumm>,
     references: Vec<PostgresTableReferences>,
     indexed_columns: Vec<PostgresIndexedColumns>,
+    pg_functions: Vec<PostgresFunction>,
 ) -> IntrospectionResult {
     let introspection_results = pg_tables
         .iter()
@@ -137,6 +151,33 @@ pub fn convert_introspect_data(
                 })
                 .collect_vec();
 
+            let function_ops: Vec<Operation> = pg_functions
+                .iter()
+                .filter(|function| match &function.return_type {
+                    PostgresFunctionReturn::Scalar => false,
+                    PostgresFunctionReturn::SingleObject { table_name } => {
+                        table_name.eq(&table.name)
+                    }
+                    PostgresFunctionReturn::SetOfObject { table_name } => {
+                        table_name.eq(&table.name)
+                    }
+                })
+                .map(|function| {
+                    let return_type = match function.return_type {
+                        PostgresFunctionReturn::Scalar => ReturnType::Object, //TODO: Should never happne
+                        PostgresFunctionReturn::SingleObject { .. } => ReturnType::Object,
+                        PostgresFunctionReturn::SetOfObject { .. } => ReturnType::Array,
+                    };
+
+                    Operation {
+                        name: function.name.to_owned(),
+                        return_type,
+                        args: vec![],
+                        operation_type: OperationType::Function,
+                    }
+                })
+                .collect_vec();
+
             let indexed_cols_ops = non_pk_indexed_cols
                 .iter()
                 .map(|indexed_columns| {
@@ -192,6 +233,7 @@ pub fn convert_introspect_data(
                             ReturnType::Array
                         },
                         args: [base_args, pagination_args].concat(),
+                        operation_type: OperationType::Table,
                     }
                 })
                 .collect_vec();
@@ -213,6 +255,7 @@ pub fn convert_introspect_data(
                                 }
                             })
                             .collect_vec(),
+                        operation_type: OperationType::Table,
                     },
                     Operation {
                         name: format!("list_{}", table.name),
@@ -229,15 +272,17 @@ pub fn convert_introspect_data(
                                 arg_type: ArgType::BuiltIn,
                             },
                         ],
+                        operation_type: OperationType::Table,
                     },
                     Operation {
                         name: format!("search_{}", table.name),
                         return_type: ReturnType::Array,
                         args: vec![],
+                        operation_type: OperationType::Table,
                     },
                 ];
 
-                [base, indexed_cols_ops].concat()
+                [base, indexed_cols_ops, function_ops].concat()
             } else {
                 vec![]
             };
@@ -250,6 +295,40 @@ pub fn convert_introspect_data(
                     .map(|col| PrimaryKey(col.to_owned().to_owned()))
                     .collect_vec(),
                 toplevel_ops,
+            }
+        })
+        .collect_vec();
+
+    let functions: Vec<DatabaseFunction> = pg_functions
+        .iter()
+        .map(|pg_function| {
+            let table = tables
+                .iter()
+                .find(|table| match &pg_function.return_type {
+                    PostgresFunctionReturn::Scalar => false,
+                    PostgresFunctionReturn::SingleObject { table_name } => {
+                        table.name.eq(table_name)
+                    }
+                    PostgresFunctionReturn::SetOfObject { table_name } => table.name.eq(table_name),
+                })
+                .expect("Unable to find matching table");
+
+            let args = pg_function
+                .args
+                .iter()
+                .map(|pg_arg| {
+                    let arg_type = pg_arg.to_graphql_arg().tpe;
+                    FunctionArg {
+                        name: pg_arg.arg_name.to_string(),
+                        arg_type,
+                    }
+                })
+                .collect_vec();
+
+            DatabaseFunction {
+                name: pg_function.name.to_owned(),
+                table: table.to_owned(),
+                args,
             }
         })
         .collect_vec();
@@ -291,7 +370,7 @@ pub fn convert_introspect_data(
                 ReturnType::Array
             };
 
-            vec![
+            let table_relationships = vec![
                 DatabaseRelationship {
                     table_name: table.name.to_string(),
                     column_name: column.name.to_string(),
@@ -310,13 +389,45 @@ pub fn convert_introspect_data(
                     return_type: second_return_type,
                     column_optional: !foreign_column.required,
                 },
-            ]
+            ];
+
+            table_relationships
         })
         .collect_vec();
+
+    println!("{:#?}", functions);
+
+    let table_iter = tables.iter().flat_map(|table| {
+        table.toplevel_ops.iter().map(|op| {
+            println!("{}", op.name);
+            match op.operation_type {
+                OperationType::Table => (
+                    op.name.to_owned(),
+                    Table {
+                        table: table.to_owned(),
+                    },
+                ),
+                OperationType::Function => (
+                    op.name.to_owned(),
+                    Function {
+                        function: functions
+                            .iter()
+                            .find(|function| function.name.eq(&op.name))
+                            .expect("unable to find referenced function")
+                            .to_owned(),
+                    },
+                ),
+            }
+        })
+    });
+
+    let something: HashMap<String, SelectableStuff> = table_iter.collect();
 
     IntrospectionResult {
         tables,
         relationships2,
+        functions,
+        selectable_by_operation_name: something,
     }
 }
 
@@ -362,7 +473,8 @@ async fn get_indexes(pool: &Pool<Postgres>) -> Result<Vec<PostgresIndexedColumns
     t.relname as table_name,
     i.relname as index_name,
     ns.nspname as schema_name,
-    array_agg(a.attname) as column_names
+    array_agg(a.attname) as column_names,
+    pg_get_indexdef(i.oid) as index_def
 from
     pg_class t,
     pg_class i,
@@ -380,7 +492,8 @@ where
 group by
     ns.nspname,
     t.relname,
-    i.relname
+    i.relname,
+    i.oid   
 order by
     t.relname,
     i.relname;
@@ -513,3 +626,310 @@ order by kcu.table_schema,
 
     Ok(sqlx::query_as(sql).fetch_all(pool).await?)
 }
+
+#[derive(Ord, PartialOrd, Eq, PartialEq, Debug, Clone)]
+pub enum PostgresFunctionArgType {
+    IN,
+    OUT,
+    INOUT,
+}
+#[derive(Ord, PartialOrd, Eq, PartialEq, Debug, Clone)]
+pub struct PostgresFunctionArg {
+    arg_name: String,
+    type_name: String,
+    arg_type: PostgresFunctionArgType,
+}
+
+impl PostgresFunctionArg {
+    fn to_graphql_arg(&self) -> Arg {
+        let tpe = postgres_data_type_to_input(&self.type_name);
+        Arg {
+            name: self.arg_name.to_owned(),
+            tpe,
+            arg_type: ArgType::BuiltIn,
+        }
+    }
+}
+
+#[derive(Ord, PartialOrd, Eq, PartialEq, Debug, Clone)]
+pub enum PostgresFunctionReturn {
+    Scalar,
+    SingleObject { table_name: String },
+    SetOfObject { table_name: String },
+}
+
+#[derive(Ord, PartialOrd, Eq, PartialEq, Debug, Clone)]
+pub struct PostgresFunction {
+    name: String,
+    args: Vec<PostgresFunctionArg>,
+    return_type: PostgresFunctionReturn,
+}
+
+#[derive(sqlx::FromRow)]
+struct PostgresFunctionRow {
+    function_name: String,
+    strict: bool,
+    prokind: String,
+    provolatile: String,
+    proretset: bool,
+    typename: String,
+    args: String,
+}
+
+impl PostgresFunctionRow {
+    fn extract_args(&self) -> Vec<PostgresFunctionArg> {
+        let re = Regex::new(r"(?P<INOUT>(INOUT|OUT))? ?(?P<NAME>\w*) (?P<TYPE>\w*)").unwrap();
+        self.args
+            .split(",")
+            .into_iter()
+            .filter(|str| !str.is_empty())
+            .map(|str| {
+                let captures = re.captures(str).unwrap();
+                let arg_type = match captures
+                    .name("INOUT")
+                    .map(|v| v.as_str().to_owned())
+                    .unwrap_or("IN".parse().unwrap())
+                    .as_str()
+                {
+                    "IN" => PostgresFunctionArgType::IN,
+                    "OUT" => PostgresFunctionArgType::OUT,
+                    "INOUT" => PostgresFunctionArgType::INOUT,
+                    _ => {
+                        panic!("Unable to parse argype")
+                    }
+                };
+                let arg_name = captures.name("NAME").unwrap().as_str().to_owned();
+                let type_name = captures.name("TYPE").unwrap().as_str().to_owned();
+                PostgresFunctionArg {
+                    arg_name,
+                    type_name,
+                    arg_type,
+                }
+            })
+            .collect_vec()
+    }
+
+    fn to_postgres_function(&self) -> PostgresFunction {
+        let return_type = if self.proretset {
+            SetOfObject {
+                table_name: self.typename.to_owned(),
+            }
+        } else {
+            //TODO: check if builtin type
+            SingleObject {
+                table_name: self.typename.to_owned(),
+            }
+        };
+
+        let args = self.extract_args();
+
+        PostgresFunction {
+            name: self.function_name.to_owned(),
+            args,
+            return_type,
+        }
+    }
+}
+
+async fn get_functions(pool: &Pool<Postgres>) -> Result<Vec<PostgresFunction>, sqlx::Error> {
+    let sql = "select
+    pg_proc.oid as function_oid,
+    proname as function_name,
+    proisstrict as strict,
+    prokind::text,
+    provolatile::text,
+    pg_proc.proretset,
+    pg_type.typname as typename,
+    pg_get_function_arguments(pg_proc.oid) as args
+from pg_proc
+         left join pg_namespace on pg_proc.pronamespace = pg_namespace.oid
+left join pg_type on pg_proc.prorettype = pg_type.oid
+
+where proname not like 'pgp_%'
+  and proname NOT IN
+      ('armor', 'crypt', 'dearmor', 'decrypt', 'decrypt_iv', 'digest', 'encrypt', 'encrypt_iv',
+       'gen_random_bytes', 'gen_random_uuid', 'gen_salt', 'hmac'
+          )
+  AND pg_namespace.nspname NOT LIKE 'pg_%'
+  AND pg_namespace.nspname NOT IN ('information_schema', 'hdb_catalog')
+  AND (NOT EXISTS(
+        SELECT 1
+        FROM pg_aggregate
+        WHERE ((pg_aggregate.aggfnoid) :: oid = pg_namespace.oid)
+    )
+    );";
+
+    let rows = sqlx::query_as::<_, PostgresFunctionRow>(sql)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| row.to_postgres_function())
+        .collect_vec())
+}
+
+#[derive(sqlx::FromRow, Debug)]
+pub struct PostgresBuiltInTypeRow {
+    schema: String,
+    name: String,
+}
+
+async fn get_built_in_types(
+    pool: &Pool<Postgres>,
+) -> Result<Vec<PostgresBuiltInTypeRow>, sqlx::Error> {
+    let sql = "SELECT      n.nspname as schema, t.typname as name
+FROM        pg_type t
+                LEFT JOIN   pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+WHERE       (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid))
+  AND     NOT EXISTS(SELECT 1 FROM pg_catalog.pg_type el WHERE el.oid = t.typelem AND el.typarray = t.oid);";
+
+    sqlx::query_as::<_, PostgresBuiltInTypeRow>(sql)
+        .fetch_all(pool)
+        .await
+}
+
+const list_functions_sql: &str = r#"SELECT
+    "function_info".function_schema,
+    "function_info".function_name,
+    coalesce("function_info".info, '[]'::json) AS info
+FROM (
+         SELECT
+             function_name,
+             function_schema,
+             -- This field corresponds to the 'RawFunctionInfo' Haskell type
+             json_agg(
+                     json_build_object(
+                             'oid', "pg_function".function_oid,
+                             'description', "pg_function".description,
+                             'has_variadic', "pg_function".has_variadic,
+                             'function_type', "pg_function".function_type,
+                             'return_type_schema', "pg_function".return_type_schema,
+                             'return_type_name', "pg_function".return_type_name,
+                             'return_type_type', "pg_function".return_type_type,
+                             'returns_set', "pg_function".returns_set,
+                             'input_arg_types', "pg_function".input_arg_types,
+                             'input_arg_names', "pg_function".input_arg_names,
+                             'default_args', "pg_function".default_args,
+                             'returns_table', "pg_function".returns_table
+                         )
+                 ) AS info
+         FROM (
+                  -- Necessary metadata from Postgres
+                  SELECT
+                      "function".function_name,
+                      "function".function_schema,
+                      pd.description,
+
+                      CASE
+                          WHEN ("function".provariadic = (0) :: oid) THEN false
+                          ELSE true
+                          END AS has_variadic,
+
+                      CASE
+                          WHEN (
+                                  ("function".provolatile) :: text = ('i' :: character(1)) :: text
+                              ) THEN 'IMMUTABLE' :: text
+                          WHEN (
+                                  ("function".provolatile) :: text = ('s' :: character(1)) :: text
+                              ) THEN 'STABLE' :: text
+                          WHEN (
+                                  ("function".provolatile) :: text = ('v' :: character(1)) :: text
+                              ) THEN 'VOLATILE' :: text
+                          ELSE NULL :: text
+                          END AS function_type,
+
+pg_get_functiondef("function".function_oid) AS function_definition,
+
+	        rtn.nspname::text as return_type_schema,
+	        rt.typname::text as return_type_name,
+	        rt.typtype::text as return_type_type,
+	        "function".proretset AS returns_set,
+	        ( SELECT
+	            COALESCE(json_agg(
+	              json_build_object('schema', q."schema",
+	                                'name', q."name",
+	                                'type', q."type"
+	                               )
+	            ), '[]')
+	          FROM
+	            (
+	              SELECT
+	                pt.typname AS "name",
+	                pns.nspname AS "schema",
+	                pt.typtype AS "type",
+	                pat.ordinality
+	              FROM
+	                unnest(
+	                  COALESCE("function".proallargtypes, ("function".proargtypes) :: oid [])
+	                ) WITH ORDINALITY pat(oid, ordinality)
+	                LEFT JOIN pg_type pt ON ((pt.oid = pat.oid))
+	                LEFT JOIN pg_namespace pns ON (pt.typnamespace = pns.oid)
+	              ORDER BY pat.ordinality ASC
+	            ) q
+	         ) AS input_arg_types,
+	        to_json(COALESCE("function".proargnames, ARRAY [] :: text [])) AS input_arg_names,
+	        "function".pronargdefaults AS default_args,
+	        "function".function_oid::integer AS function_oid,
+	        (exists(
+	          SELECT
+	            1
+	            FROM
+	              information_schema.tables
+	            WHERE
+	              table_schema = rtn.nspname::text
+	              AND table_name = rt.typname::text
+	          ) OR
+	         exists(
+	           SELECT
+	             1
+	             FROM
+	                 pg_matviews
+	           WHERE
+	                schemaname = rtn.nspname::text
+	            AND matviewname = rt.typname::text
+	          )
+	        ) AS returns_table
+
+FROM
+	        (SELECT   p.oid AS function_oid,
+	                   p.*,
+	                   p.proname::text AS function_name,
+	                   pn.nspname::text AS function_schema
+	              FROM pg_proc p
+	              JOIN pg_namespace pn ON (pn.oid = p.pronamespace)) as "function"
+
+	        JOIN pg_type rt ON (rt.oid = "function".prorettype)
+	        JOIN pg_namespace rtn ON (rtn.oid = rt.typnamespace)
+	        LEFT JOIN pg_description pd ON "function".function_oid = pd.objoid
+	      WHERE
+	        -- Do not fetch some default functions in public schema
+	        "function".function_name NOT LIKE 'pgp_%'
+	        AND "function".function_name NOT IN
+	                          ( 'armor'
+	                          , 'crypt'
+	                          , 'dearmor'
+	                          , 'decrypt'
+	                          , 'decrypt_iv'
+	                          , 'digest'
+	                          , 'encrypt'
+	                          , 'encrypt_iv'
+	                          , 'gen_random_bytes'
+	                          , 'gen_random_uuid'
+	                          , 'gen_salt'
+	                          , 'hmac'
+	                          )
+	        AND "function".function_schema NOT LIKE 'pg_%'
+	        AND "function".function_schema NOT IN ('information_schema', 'hdb_catalog')
+	        AND (NOT EXISTS (
+	                SELECT
+	                  1
+	                FROM
+	                  pg_aggregate
+	                WHERE
+	                  ((pg_aggregate.aggfnoid) :: oid = "function".function_oid)
+	              )
+	          )
+	    ) AS "pg_function"
+	    GROUP BY "pg_function".function_schema, "pg_function".function_name
+	  ) "function_info""#;
