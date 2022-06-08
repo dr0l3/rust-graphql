@@ -10,10 +10,11 @@
     - Pagination
 - Without using fragments
 - And only using inline variable
+- Functions
+  - As top level operations
 
 # Non working stuff
 - Fragments
-- Functions
 - GraphQL schema introspection
 - Other operations
   - Update
@@ -34,3 +35,4 @@
 - Federation
 - fuzzy search operations
   - if index covers field
+- Functions as joins targets

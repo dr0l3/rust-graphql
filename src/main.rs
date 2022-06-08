@@ -2,19 +2,16 @@ mod postgres_introspect;
 
 extern crate core;
 extern crate dotenv;
+extern crate futures_util;
 
 use crate::futures_util::StreamExt;
-use crate::indexmap::IndexMap;
 use crate::postgres_introspect::IntrospectionResult;
 use crate::SelectableStuff::{Function, Table};
 use crate::SqlQuery::FunctionSelection;
-use async_graphql::registry::{MetaType, MetaTypeId, Registry};
-use async_graphql::{
-    parser::parse_query,
-    parser::types::{ExecutableDocument, Field, OperationDefinition, Selection},
-    *,
-};
 use futures::future::*;
+use graphql_parser::query::{
+    Definition, Document, Field, OperationDefinition, Query, Selection, SelectionSet,
+};
 use itertools::Itertools;
 use postgres_introspect::{convert_introspect_data, fetch_introspection_data};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
@@ -472,13 +469,13 @@ impl SqlQuery {
     }
 }
 
-fn inner(selection: &Selection) -> Field {
-    match selection {
-        Selection::Field(Positioned { node, .. }) => node.to_owned(),
-        Selection::FragmentSpread(_) => todo!(),
-        Selection::InlineFragment(_) => todo!(),
-    }
-}
+// fn inner(selection: &Selection) -> Field {
+//     match selection {
+//         Selection::Field(Positioned { node, .. }) => node.to_owned(),
+//         Selection::FragmentSpread(_) => todo!(),
+//         Selection::InlineFragment(_) => todo!(),
+//     }
+// }
 
 enum SearchPlace {
     TopLevel,
@@ -510,22 +507,13 @@ impl SelectableStuff {
 }
 
 fn field_to_table_selection(
-    field: &Field,
+    field: &Field<String>,
     introspection: &IntrospectionResult,
     search_place: &SearchPlace,
     path: String,
 ) -> SqlQuery {
-    // TODO: Start here. Need to support functions as well as tables
-
-    println!(
-        "field_name: {} ops: {:#?}",
-        field.response_key().node.to_string(),
-        introspection.selectable_by_operation_name
-    );
-
-    let selectable = introspection
-        .selectable_by_operation_name
-        .get(&field.response_key().node.to_string());
+    let field_name = field.name.to_owned();
+    let selectable = introspection.selectable_by_operation_name.get(&field_name);
 
     let table = match search_place {
         SearchPlace::TopLevel => match selectable.expect("unable to find selectable") {
@@ -540,46 +528,76 @@ fn field_to_table_selection(
             .expect("Unable to find relationship"),
     };
 
-    let columns: Vec<String> = field
+    let col_fields = field
         .selection_set
-        .node
         .items
         .iter()
-        .map(|Positioned { node, .. }| inner(node))
-        .map(|f| f.response_key().node.to_string())
-        .filter(|col_name| {
-            //TODO: Should probably explode instead of silently ignoring fields
+        .filter_map(|sel| match sel {
+            Selection::Field(f) => {
+                if f.selection_set.items.len() == 0 {
+                    Some(f)
+                } else {
+                    None
+                }
+            }
+            Selection::FragmentSpread(_) => {
+                todo!()
+            }
+            Selection::InlineFragment(_) => {
+                todo!()
+            }
+        });
+    let join_fields = field
+        .selection_set
+        .items
+        .iter()
+        .filter_map(|sel| match sel {
+            Selection::Field(f) => {
+                if f.selection_set.items.len() > 0 {
+                    Some(f)
+                } else {
+                    None
+                }
+            }
+            Selection::FragmentSpread(_) => {
+                todo!()
+            }
+            Selection::InlineFragment(_) => {
+                todo!()
+            }
+        });
+
+    let columns = col_fields
+        .map(|field| {
             table
                 .get_all_columns()
-                .find(|col| col.name.eq(col_name))
-                .is_some()
+                .find(|col| col.name.eq(&field.name))
+                .expect("Unable to find colum")
+                .name
+                .to_owned()
         })
-        .collect();
+        .collect_vec();
 
-    let joins = field
-        .selection_set
-        .node
-        .items
-        .iter()
-        .map(|Positioned { node, .. }| inner(node))
-        .filter(|field| field.selection_set.node.items.len() > 0)
-        .map(|field| {
-            // println!("wutwutwut {} {}", table.name, field.name.node.to_string());
-
+    let joins = join_fields
+        .map(|f| {
+            println!(
+                "field: {:#?} relationsips: {:#?}, tablename: {}",
+                f, introspection.relationships2, table.name
+            );
             let relationship = introspection
                 .relationships2
                 .iter()
                 .find(|relationship| {
-                    relationship.table_name.eq(&table.name)
-                        && relationship
-                            .field_name
-                            .contains(&field.name.node.to_string())
+                    relationship.table_name.eq(&table.name) && relationship.field_name.eq(&f.name)
                 })
-                .expect("Unable to find relationship")
+                .expect("Unable to find relationshp")
                 .to_owned();
-            (field, relationship)
+
+            (f, relationship)
         })
-        .collect::<Vec<(Field, DatabaseRelationship)>>();
+        .collect_vec();
+
+    println!("{:#?}", joins);
 
     // I do know which joins have been selected
     // I do know which table "this" field corresponds to
@@ -591,11 +609,11 @@ fn field_to_table_selection(
         .iter()
         .map(|(field, relationship)| {
             let relationship_param = relationship.to_owned();
-            let updated_path = format!("{}.{}", path, field.name.node);
+            let updated_path = format!("{}.{}", path, field.name);
 
             (
                 field_to_table_selection(
-                    field,
+                    &field,
                     introspection,
                     &SearchPlace::Relationship {
                         relationship: relationship_param,
@@ -620,7 +638,7 @@ fn field_to_table_selection(
             let op = table
                 .toplevel_ops
                 .iter()
-                .find(|op| op.name.eq(&field.name.node))
+                .find(|op| op.name.eq(&field_name))
                 .unwrap();
 
             op.args
@@ -630,8 +648,8 @@ fn field_to_table_selection(
                     let field_arg = field
                         .arguments
                         .iter()
-                        .find(|(field_arg, _)| op_arg.name.eq(&field_arg.node))
-                        .map(|(_, value)| value.node.to_string());
+                        .find(|(name, value)| name.eq(&op_arg.name))
+                        .map(|(_, value)| value.to_string());
 
                     WhereClause {
                         path: None,
@@ -674,14 +692,14 @@ fn field_to_table_selection(
             let op = table
                 .toplevel_ops
                 .iter()
-                .find(|op| op.name.eq(&field.name.node))
+                .find(|op| op.name.eq(&field.name))
                 .unwrap();
 
             let limit_arg = field
                 .arguments
                 .iter()
-                .find(|(field_arg, _)| field_arg.node.eq("limit"))
-                .map(|(_, value)| value.node.to_string().parse::<u32>().unwrap())
+                .find(|(name, _)| name.eq("limit"))
+                .map(|(_, value)| value.to_string().parse::<u32>().unwrap())
                 .or(op
                     .args
                     .iter()
@@ -700,8 +718,8 @@ fn field_to_table_selection(
             let offset_arg = field
                 .arguments
                 .iter()
-                .find(|(field_arg, _)| field_arg.node.eq("offset"))
-                .map(|(_, value)| value.node.to_string().parse::<u32>().unwrap())
+                .find(|(name, _)| name.eq("offset"))
+                .map(|(_, value)| value.to_string().parse::<u32>().unwrap())
                 .or(op
                     .args
                     .iter()
@@ -731,14 +749,14 @@ fn field_to_table_selection(
                 let limit_arg = field
                     .arguments
                     .iter()
-                    .find(|(field_arg, _)| field_arg.node.eq("limit"))
-                    .map(|(_, value)| value.node.to_string().parse::<u32>().unwrap());
+                    .find(|(name, _)| name.eq("limit"))
+                    .map(|(_, value)| value.to_string().parse::<u32>().unwrap());
 
                 let offset_arg = field
                     .arguments
                     .iter()
-                    .find(|(field_arg, _)| field_arg.node.eq("offset"))
-                    .map(|(_, value)| value.node.to_string().parse::<u32>().unwrap());
+                    .find(|(name, _)| name.eq("offset"))
+                    .map(|(_, value)| value.to_string().parse::<u32>().unwrap());
 
                 Some(TablePagination {
                     limit: limit_arg.unwrap_or(25u32),
@@ -753,7 +771,7 @@ fn field_to_table_selection(
             table
                 .toplevel_ops
                 .iter()
-                .find(|op| op.name.eq(&field.name.node.to_string()))
+                .find(|op| op.name.eq(&field.name))
                 .expect("Unable to find top level ops")
                 .return_type
         }
@@ -765,11 +783,11 @@ fn field_to_table_selection(
             Table { table } => SqlQuery::TableSelection {
                 left_joins: selected_joins,
                 where_clauses,
-                column_names: columns,
+                column_names: columns.to_owned(),
                 table_name: table.name.to_owned(),
                 return_type,
                 pagination,
-                field_name: field.name.node.to_string(),
+                field_name: field.name.to_string(),
                 path,
             },
             Function { function } => {
@@ -777,12 +795,12 @@ fn field_to_table_selection(
                     .args
                     .iter()
                     .map(|arg| {
-                        println!("{:#?}", arg);
+                        println!("{:#?}, {:#?}", arg, field.arguments);
                         let arg_value = field
                             .arguments
                             .iter()
-                            .find(|(field_arg, _)| field_arg.node.eq(&arg.name))
-                            .map(|(_, value)| value.node.to_string())
+                            .find(|(name, _)| name.eq(&arg.name))
+                            .map(|(_, value)| value.to_string())
                             .expect("Unable to find argument");
                         FunctionSelectionArgument {
                             value: arg_value,
@@ -793,12 +811,12 @@ fn field_to_table_selection(
 
                 FunctionSelection {
                     function_name: function.name.to_string(),
-                    column_names: columns,
+                    column_names: columns.to_owned(),
                     left_joins: selected_joins,
                     where_clauses,
                     pagination,
                     return_type,
-                    field_name: field.name.node.to_string(),
+                    field_name: field.name.to_string(),
                     path,
                     arguments,
                 }
@@ -807,40 +825,51 @@ fn field_to_table_selection(
         SearchPlace::Relationship { .. } => SqlQuery::TableSelection {
             left_joins: selected_joins,
             where_clauses,
-            column_names: columns,
+            column_names: columns.to_owned(),
             table_name: table.name.to_owned(),
             return_type,
             pagination,
-            field_name: field.name.node.to_string(),
+            field_name: field.name.to_string(),
             path,
         },
     }
 }
 
-fn to_intermediate(
-    query: &ExecutableDocument,
-    introspection: &IntrospectionResult,
-) -> Vec<SqlQuery> {
-    let ops = query
-        .operations
-        .iter()
-        .map(|(_, Positioned { node, .. })| node.to_owned())
-        .collect::<Vec<OperationDefinition>>();
+fn to_intermediate(query: &Document<String>, introspection: &IntrospectionResult) -> Vec<SqlQuery> {
+    let ops = query.definitions.to_owned();
 
     ops.iter()
-        .flat_map(|operation_definition| {
-            operation_definition.selection_set.node.items.iter().map(
-                |Positioned { node, .. }| match node {
-                    Selection::Field(Positioned { node, .. }) => field_to_table_selection(
-                        &node,
-                        introspection,
-                        &SearchPlace::TopLevel,
-                        "root".to_string(),
-                    ),
-                    Selection::FragmentSpread(_) => todo!(),
-                    Selection::InlineFragment(_) => todo!(),
-                },
-            )
+        .flat_map(|operation_definition| match operation_definition {
+            Definition::Operation(op) => match op {
+                OperationDefinition::Query(q) => {
+                    q.selection_set.items.iter().map(|wat| match wat {
+                        Selection::Field(f) => field_to_table_selection(
+                            f,
+                            introspection,
+                            &SearchPlace::TopLevel,
+                            "root".to_string(),
+                        ),
+                        Selection::FragmentSpread(_) => {
+                            todo!()
+                        }
+                        Selection::InlineFragment(_) => {
+                            todo!()
+                        }
+                    })
+                }
+                OperationDefinition::SelectionSet(_) => {
+                    todo!()
+                }
+                OperationDefinition::Mutation(_) => {
+                    todo!()
+                }
+                OperationDefinition::Subscription(_) => {
+                    todo!()
+                }
+            },
+            Definition::Fragment(_) => {
+                todo!()
+            }
         })
         .collect_vec()
 }
@@ -855,6 +884,7 @@ mod tests {
     use derivative::*;
     use futures::future::{join_all, try_join_all};
     use futures::{join, select, try_join};
+    use graphql_parser::parse_query;
     use sqlformat::{format, FormatOptions, QueryParams};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -863,7 +893,6 @@ mod tests {
     use crate::Column;
     use crate::DatabaseTable;
     use crate::PrimaryKey;
-    use async_graphql::parser::parse_query;
     use dockertest::waitfor::{MessageSource, MessageWait};
     use dockertest::{Composition, DockerTest, Source};
     use itertools::Itertools;
@@ -936,7 +965,7 @@ mod tests {
             convert_introspect_data(tables, constraints, cols, references, indexes, functions);
 
         println!("{:#?}", introspection);
-        let query = parse_query(query).unwrap();
+        let query = parse_query(&query).unwrap();
         let intermediate = to_intermediate(&query, &introspection);
 
         println!("{:#?}", intermediate);
