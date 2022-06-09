@@ -242,15 +242,17 @@ pub struct PostgresTableRow {
 const extract_name_regex: &str = "";
 
 impl PostgresTableRow {
-    fn get_name(&self) -> &str {
-        let name_extraction_regex: Regex = Regex::new(r"^.*@rename\((?P<NAME>\w+)\).*$").unwrap();
+    fn get_name(&self) -> String {
+        self.get_graphql_name().unwrap_or(self.name.to_owned())
+    }
 
+    fn get_graphql_name(&self) -> Option<String> {
+        let name_extraction_regex: Regex = Regex::new(r"^.*@rename\((?P<NAME>\w+)\).*$").unwrap();
         self.comment
             .as_ref()
             .and_then(|str| name_extraction_regex.captures(&str))
             .and_then(|captures| captures.name("NAME"))
-            .map(|regex_match| regex_match.as_str())
-            .unwrap_or(&self.name)
+            .map(|regex_match| String::from(regex_match.as_str()))
     }
 }
 
@@ -912,7 +914,7 @@ fn field_to_table_selection(
         })
         .collect();
 
-    let joins = join_fields
+    let joins: Result<Vec<(&Field<String>, &DatabaseRelationship)>, String> = join_fields
         .map(|f| {
             println!(
                 "field: {:#?} relationsips: {:#?}, tablename: {}",
@@ -924,12 +926,11 @@ fn field_to_table_selection(
                 .find(|relationship| {
                     relationship.table_name.eq(&table.name) && relationship.field_name.eq(&f.name)
                 })
-                .expect("Unable to find relationshp")
-                .to_owned();
+                .ok_or("Unable to find relationship")?;
 
-            (f, relationship)
+            Ok((f, relationship))
         })
-        .collect_vec();
+        .collect();
 
     println!("{:#?}", joins);
 
@@ -1130,7 +1131,7 @@ fn field_to_table_selection(
     // - right table (get from recursive call)
     // - left col (have that from relationship)
     // - right col (have tha from relationship)
-    let selected_joins: Result<Vec<LeftJoin>, String> = joins
+    let selected_joins: Result<Vec<LeftJoin>, String> = joins?
         .iter()
         .map(|(field, relationship)| {
             let relationship_param = relationship.to_owned();
@@ -1140,7 +1141,7 @@ fn field_to_table_selection(
                 &field,
                 introspection,
                 &SearchPlace::Relationship {
-                    relationship: relationship_param,
+                    relationship: relationship_param.to_owned(),
                     path: path.to_owned(),
                 },
                 updated_path,
@@ -2258,6 +2259,39 @@ mod tests {
 
         let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!({"a": 1, "b_renamed": "rune"});
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_rename() -> Result<(), String> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text);"),
+            String::from("insert into test values(1, 'rune');"),
+            String::from("create table test2(c int primary key, d int references test(a));"),
+            String::from("insert into test2 values(1, 1);"),
+            String::from("comment on table test is '@rename(test_renamed)'"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                list_test2 {
+                    c
+                    d
+                    test_renamed {
+                        a
+                        b
+                    }
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(&init_sql, graphql_query).await?;
+        let expected = serde_json::json!([{"c": 1, "d": 1,"test_renamed":{"a": 1, "b": "rune"}}]);
 
         assert_eq!(expected, actual);
 

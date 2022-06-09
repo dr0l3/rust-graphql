@@ -409,7 +409,7 @@ pub fn convert_introspect_data(
                     .map(|col| PrimaryKey(col.to_owned().to_owned()))
                     .collect_vec(),
                 toplevel_ops,
-                graphql_name: None,
+                graphql_name: table_row.get_graphql_name(),
             }
         })
         .collect_vec();
