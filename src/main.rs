@@ -19,6 +19,7 @@ use postgres_introspect::{convert_introspect_data, fetch_introspection_data};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::fmt::{format, Display, Formatter};
 use std::ops::{Add, Deref, DerefMut};
 use std::sync::{Arc, Mutex};
@@ -224,19 +225,20 @@ pub struct PostgresTableRow {
     table_type: String,
     owner: String,
     size: String,
-    description: Option<String>,
+    comment: Option<String>,
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
-pub struct PostgresTableColumm {
+pub struct PostgresTableColummRow {
     column_name: String,
     table_name: String,
     is_nullable: String,
     data_type: String,
+    comment: Option<String>,
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
-pub struct PostgresTableReferences {
+pub struct PostgresTableReferencesRow {
     table_schema: String,
     table_name: String,
     column_name: String,
@@ -246,7 +248,7 @@ pub struct PostgresTableReferences {
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
-pub struct PostgresTableView {
+pub struct PostgresTableViewRow {
     table_schema: String,
     table_name: String,
     is_updatable: String,
@@ -776,12 +778,15 @@ fn field_to_table_selection(
     search_place: &SearchPlace,
     path: String,
     counter: &BindCounter,
-) -> SqlQuery {
+) -> Result<SqlQuery, String> {
     let field_name = field.name.to_owned();
-    let selectable = introspection.selectable_by_operation_name.get(&field_name);
+    let selectable = introspection
+        .selectable_by_operation_name
+        .get(&field_name)
+        .ok_or("Unable to find Selectable");
 
     let table = match search_place {
-        SearchPlace::TopLevel => match selectable.expect("unable to find selectable") {
+        SearchPlace::TopLevel => match selectable? {
             Table { table } => table,
             Function { function } => &function.table,
         },
@@ -832,16 +837,15 @@ fn field_to_table_selection(
             }
         });
 
-    let columns = col_fields
+    let columns: Result<Vec<String>, String> = col_fields
         .map(|field| {
-            table
+            let col = table
                 .get_all_columns()
                 .find(|col| col.name.eq(&field.name))
-                .expect("Unable to find colum")
-                .name
-                .to_owned()
+                .ok_or("Unable to find column");
+            Ok(col?.name.to_string())
         })
-        .collect_vec();
+        .collect();
 
     let joins = join_fields
         .map(|f| {
@@ -1061,7 +1065,7 @@ fn field_to_table_selection(
     // - right table (get from recursive call)
     // - left col (have that from relationship)
     // - right col (have tha from relationship)
-    let selected_joins = joins
+    let selected_joins: Result<Vec<LeftJoin>, String> = joins
         .iter()
         .map(|(field, relationship)| {
             let relationship_param = relationship.to_owned();
@@ -1076,25 +1080,25 @@ fn field_to_table_selection(
                 },
                 updated_path,
                 counter,
-            );
+            )?;
 
-            (wat, relationship)
+            Ok((wat, relationship))
         })
-        .map(|(joined_table, relationship)| LeftJoin {
+        .map_ok(|(joined_table, relationship)| LeftJoin {
             right_table: joined_table,
             join_conditions: vec![JoinCondition {
                 left_col: relationship.field_name.to_owned(),
                 right_col: relationship.target_column_name.to_owned(),
             }],
         })
-        .collect_vec();
+        .collect();
 
-    match search_place {
+    Ok(match search_place {
         SearchPlace::TopLevel => match selectable.expect("Unable to find selectable") {
             Table { table } => SqlQuery::TableSelection {
-                left_joins: selected_joins,
+                left_joins: selected_joins?,
                 where_clauses,
-                column_names: columns.to_owned(),
+                column_names: columns?.to_owned(),
                 table_name: table.name.to_owned(),
                 return_type,
                 pagination,
@@ -1122,8 +1126,8 @@ fn field_to_table_selection(
 
                 FunctionSelection {
                     function_name: function.name.to_string(),
-                    column_names: columns.to_owned(),
-                    left_joins: selected_joins,
+                    column_names: columns?.to_owned(),
+                    left_joins: selected_joins?,
                     where_clauses,
                     pagination,
                     return_type,
@@ -1134,19 +1138,22 @@ fn field_to_table_selection(
             }
         },
         SearchPlace::Relationship { .. } => SqlQuery::TableSelection {
-            left_joins: selected_joins,
+            left_joins: selected_joins?,
             where_clauses,
-            column_names: columns.to_owned(),
+            column_names: columns?.to_owned(),
             table_name: table.name.to_owned(),
             return_type,
             pagination,
             field_name: field.name.to_string(),
             path,
         },
-    }
+    })
 }
 
-fn to_intermediate(query: &Document<String>, introspection: &IntrospectionResult) -> Vec<SqlQuery> {
+fn to_intermediate(
+    query: &Document<String>,
+    introspection: &IntrospectionResult,
+) -> Result<Vec<SqlQuery>, String> {
     let ops = query.definitions.to_owned();
 
     let counter = BindCounter {
@@ -1187,7 +1194,7 @@ fn to_intermediate(query: &Document<String>, introspection: &IntrospectionResult
                 todo!()
             }
         })
-        .collect_vec()
+        .collect()
 }
 
 #[cfg(test)]
@@ -1252,7 +1259,7 @@ mod tests {
         root: serde_json::Value,
     }
 
-    async fn base_test(sql: Vec<String>, query: String) -> Result<serde_json::Value, Error> {
+    async fn base_test(sql: &Vec<String>, query: String) -> Result<serde_json::Value, String> {
         let docker = clients::Cli::default();
         let pg = docker.run(DockerPostgres {
             env_vars: HashMap::from([("POSTGRES_PASSWORD".to_owned(), "postgres".to_owned())]),
@@ -1267,6 +1274,7 @@ mod tests {
                 "postgres://postgres:postgres@0.0.0.0:{}/postgres",
                 port
             ))
+            .map_err(|err| err.to_string())
             .await?;
 
         let init = sql
@@ -1275,14 +1283,16 @@ mod tests {
             .collect_vec();
 
         for future in init {
-            future.await?;
+            future.map_err(|err| err.to_string()).await?;
         }
 
         //let init_res = try_join_all(init).await?;
         //println!("{:#?}", init_res);
 
         let (tables, constraints, cols, references, indexes, functions) =
-            fetch_introspection_data(&pool).await?;
+            fetch_introspection_data(&pool)
+                .map_err(|err| err.to_string())
+                .await?;
         let introspection =
             convert_introspect_data(tables, constraints, cols, references, indexes, functions);
 
@@ -1300,7 +1310,7 @@ mod tests {
         //     .unwrap()
         //     .to_owned();
 
-        let sqlquery = &intermediate[0];
+        let sqlquery = &intermediate?[0];
         let sql = sqlquery.to_json_sql();
         let binds = sqlquery.extract_binds_sorted();
 
@@ -1340,7 +1350,7 @@ mod tests {
 
         //let res: (serde_json::Value,) = sqlx::query_as(&executable_sql).fetch_one(&pool).await?;
         pg.stop();
-        res2.map(|omg| omg.get(0))
+        res2.map(|omg| omg.get(0)).map_err(|err| err.to_string())
     }
 
     async fn base_test_schema(sql: Vec<String>) -> Result<Document<'static, String>, Error> {
@@ -1384,7 +1394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_table() -> Result<(), Error> {
+    async fn simple_table() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text)"),
             String::from("insert into test values(1, 'rune')"),
@@ -1401,7 +1411,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!({"a": 1, "b": "rune"});
 
         assert_eq!(expected, actual);
@@ -1410,7 +1420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_table_uuid_pk() -> Result<(), Error> {
+    async fn simple_table_uuid_pk() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a uuid primary key, b text)"),
             String::from("insert into test values('1ea0f505-b0e6-4a97-881e-a105fd580998', 'rune')"),
@@ -1427,7 +1437,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected =
             serde_json::json!({"a": "1ea0f505-b0e6-4a97-881e-a105fd580998", "b": "rune"});
 
@@ -1437,7 +1447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_table_subset_select() -> Result<(), Error> {
+    async fn simple_table_subset_select() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text)"),
             String::from("insert into test values(1, 'rune')"),
@@ -1453,7 +1463,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!({"b": "rune"});
 
         assert_eq!(expected, actual);
@@ -1462,7 +1472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_docker() -> Result<(), Error> {
+    async fn join_docker() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text);"),
             String::from("insert into test values(1, 'rune');"),
@@ -1485,7 +1495,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!({"c": 1, "d": 1,"test":{"a": 1, "b": "rune"}});
 
         assert_eq!(expected, actual);
@@ -1494,7 +1504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_table_get_all() -> Result<(), Error> {
+    async fn simple_table_get_all() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a uuid primary key, b text)"),
             String::from("insert into test values('1ea0f505-b0e6-4a97-881e-a105fd580998', 'rune')"),
@@ -1514,7 +1524,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"a": "1ea0f505-b0e6-4a97-881e-a105fd580998", "b": "rune"}, {"a": "78a17f38-91fd-48be-a985-3342ab5f65c5", "b": "rune2"}]);
 
         assert_eq!(expected, actual);
@@ -1523,7 +1533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_docker_list_all() -> Result<(), Error> {
+    async fn join_docker_list_all() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text);"),
             String::from("insert into test values(1, 'rune');"),
@@ -1548,7 +1558,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"c": 1, "d": 1,"test":{"a": 1, "b": "rune"}}, {"c": 2, "d": 2,"test":{"a": 2, "b": "rune2"}}]);
 
         assert_eq!(expected, actual);
@@ -1557,7 +1567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_table_get_some_with_pagination() -> Result<(), Error> {
+    async fn simple_table_get_some_with_pagination() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a uuid primary key, b text)"),
             String::from("insert into test values('1ea0f505-b0e6-4a97-881e-a105fd580998', 'rune')"),
@@ -1585,7 +1595,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected =
             serde_json::json!([{"b": "rune"}, {"b": "rune2"}, {"b": "rune3"}, {"b": "rune4"}]);
 
@@ -1595,7 +1605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_table_get_all_with_pagination_and_offset() -> Result<(), Error> {
+    async fn simple_table_get_all_with_pagination_and_offset() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a uuid primary key, b text)"),
             String::from("insert into test values('1ea0f505-b0e6-4a97-881e-a105fd580998', 'rune')"),
@@ -1623,7 +1633,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected =
             serde_json::json!([{"b": "rune2"}, {"b": "rune3"}, {"b": "rune4"},{"b": "rune5"}]);
 
@@ -1633,7 +1643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_pagination() -> Result<(), Error> {
+    async fn nested_pagination() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text);"),
             String::from("insert into test values(1, 'rune');"),
@@ -1658,7 +1668,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!({"a": 1, "b": "rune", "test2": [{"c": 1, "d": 1}]});
 
         assert_eq!(expected, actual);
@@ -1667,7 +1677,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_pagination_with_offset() -> Result<(), Error> {
+    async fn nested_pagination_with_offset() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text);"),
             String::from("insert into test values(1, 'rune');"),
@@ -1692,7 +1702,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!({"a": 1, "b": "rune", "test2": [{"c": 2, "d": 1}]});
 
         assert_eq!(expected, actual);
@@ -1701,7 +1711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_by_non_pk() -> Result<(), Error> {
+    async fn search_by_non_pk() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text)"),
             String::from("insert into test values(1, 'rune')"),
@@ -1719,7 +1729,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"a": 1, "b": "rune"}]);
 
         assert_eq!(expected, actual);
@@ -1728,7 +1738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_by_non_pk_negative() -> Result<(), Error> {
+    async fn search_by_non_pk_negative() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text)"),
             String::from("insert into test values(1, 'rune')"),
@@ -1746,7 +1756,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!([]);
 
         assert_eq!(expected, actual);
@@ -1755,7 +1765,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_by_non_pk_compound() -> Result<(), Error> {
+    async fn search_by_non_pk_compound() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text, c text)"),
             String::from("insert into test values(1, 'rune', 'drole')"),
@@ -1774,7 +1784,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"a": 1, "b": "rune", "c": "drole"}]);
 
         assert_eq!(expected, actual);
@@ -1783,7 +1793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_by_non_pk_compound_negative() -> Result<(), Error> {
+    async fn search_by_non_pk_compound_negative() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text, c text)"),
             String::from("insert into test values(1, 'rune', 'drole')"),
@@ -1802,7 +1812,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!([]);
 
         assert_eq!(expected, actual);
@@ -1811,7 +1821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_by_non_pk_compound_unique() -> Result<(), Error> {
+    async fn search_by_non_pk_compound_unique() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text, c text, unique(b,c))"),
             String::from("insert into test values(1, 'rune', 'drole')"),
@@ -1830,7 +1840,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!({"a": 1, "b": "rune", "c": "drole"});
 
         assert_eq!(expected, actual);
@@ -1839,7 +1849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_by_non_pk_unique() -> Result<(), Error> {
+    async fn search_by_non_pk_unique() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text unique)"),
             String::from("insert into test values(1, 'rune')"),
@@ -1857,7 +1867,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!({"a": 1, "b": "rune"});
 
         assert_eq!(expected, actual);
@@ -1866,7 +1876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_by_non_pk_with_pagination() -> Result<(), Error> {
+    async fn search_by_non_pk_with_pagination() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text)"),
             String::from("insert into test values(1, 'rune')"),
@@ -1888,7 +1898,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"a": 1, "b": "rune"}, {"a": 2, "b": "rune"}, {"a": 3, "b": "rune"}, {"a": 4, "b": "rune"}]);
 
         assert_eq!(expected, actual);
@@ -1897,7 +1907,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_function_get_all() -> Result<(), Error> {
+    async fn simple_function_get_all() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a uuid primary key, b text)"),
             String::from("create function test_function() returns setof test as $$ select * from test $$ language sql stable"),
@@ -1918,7 +1928,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"a": "1ea0f505-b0e6-4a97-881e-a105fd580998", "b": "rune"}, {"a": "78a17f38-91fd-48be-a985-3342ab5f65c5", "b": "rune2"}]);
 
         assert_eq!(expected, actual);
@@ -1927,7 +1937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_function_source() -> Result<(), Error> {
+    async fn join_function_source() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text);"),
             String::from("create function test_function() returns setof test as $$ select * from test $$ language sql stable"),
@@ -1953,7 +1963,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"a": 1, "b": "rune","test2":[{"c": 1, "d": 1}]}, {"a": 2, "b": "rune2","test2":[{"c": 2, "d": 2}]}]);
 
         assert_eq!(expected, actual);
@@ -1962,7 +1972,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_function_source_with_string_argument() -> Result<(), Error> {
+    async fn join_function_source_with_string_argument() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text);"),
             String::from("create function test_function(b_arg text) returns setof test as $$ select * from test where b = b_arg $$ language sql stable"),
@@ -1990,7 +2000,7 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"a": 1, "b": "rune","test2":[{"c": 1, "d": 1}]}, {"a": 2, "b": "rune","test2":[{"c": 2, "d": 2}]}]);
 
         assert_eq!(expected, actual);
@@ -1999,7 +2009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_function_source_with_numeric_argument() -> Result<(), Error> {
+    async fn join_function_source_with_numeric_argument() -> Result<(), String> {
         let init_sql = vec![
             String::from("create table test(a int primary key, b text);"),
             String::from("create function test_function(l_arg integer) returns setof test as $$ select * from test limit l_arg $$ language sql stable"),
@@ -2027,10 +2037,77 @@ mod tests {
             "#,
         );
 
-        let actual = base_test(init_sql, graphql_query).await?;
+        let actual = base_test(&init_sql, graphql_query).await?;
         let expected = serde_json::json!([{"a": 1, "b": "rune","test2":[{"c": 1, "d": 1}]}, {"a": 2, "b": "rune","test2":[{"c": 2, "d": 2}]}]);
 
         assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hidden_table() -> Result<(), String> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text);"),
+            String::from("comment on table test is '@ignore';"),
+            String::from("insert into test values(1, 'rune');"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                test {
+                    a
+                    b
+                }
+            }
+            "#,
+        );
+
+        let res = base_test(&init_sql, graphql_query).await;
+        println!("{:#?}", res);
+        assert_eq!(true, res.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hidden_column() -> Result<(), String> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text);"),
+            String::from("comment on column test.b is '@ignore';"),
+            String::from("insert into test values(1, 'rune');"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                get_test_by_id(a: 1) {
+                    a
+                    b
+                }
+            }
+            "#,
+        );
+
+        let res = base_test(&init_sql, graphql_query).await;
+        println!("{:#?}", res);
+        assert_eq!(true, res.is_err());
+        println!("FIST ONE SUCCESSED");
+
+        let graphql_query2 = String::from(
+            r#"
+            query test {
+                get_test_by_id(a: 1) {
+                    a
+                }
+            }
+            "#,
+        );
+        let res2 = base_test(&init_sql, graphql_query2).await?;
+        let expected = serde_json::json!({"a": 1});
+
+        assert_eq!(res2, expected);
 
         Ok(())
     }

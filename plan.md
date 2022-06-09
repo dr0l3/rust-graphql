@@ -13,17 +13,15 @@
 - Functions
   - As top level operations
 - GraphQL schema introspection
-
-# Non working stuff
-- Fragments
-- Other operations
-  - Update
-  - Insert
-  - Delete
 - Efficiency
   - Binds in SQL
-- Other databases
-  - SQLite
+- configuration
+  - Table
+    - Ignore
+  - Column
+    - Ignore
+
+# Non working stuff
 - Configuration
   - Table
     - Hide
@@ -32,6 +30,17 @@
     - Hide
     - Rename
     - Read only
+- Views
+- Faster tests
+  - Shared postgres (should be possible with use of either lazy static or sync::Once)
+- Fragments
+- Other operations
+  - Update
+  - Insert
+  - Delete
+- Other databases
+  - SQLite
+
 - Federation
 - fuzzy search operations
   - if index covers field
