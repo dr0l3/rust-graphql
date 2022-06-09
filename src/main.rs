@@ -16,6 +16,7 @@ use graphql_parser::schema::Value;
 use itertools::{concat, Itertools};
 use num_traits::cast::ToPrimitive;
 use postgres_introspect::{convert_introspect_data, fetch_introspection_data};
+use regex::Regex;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::BTreeMap;
@@ -44,6 +45,7 @@ pub struct DatabaseTable {
     pub columns: Vec<Column>,
     pub primary_keys: Vec<PrimaryKey>,
     pub toplevel_ops: Vec<Operation>,
+    pub graphql_name: Option<String>,
 }
 
 impl DatabaseTable {
@@ -84,11 +86,12 @@ impl DatabaseTable {
             .collect_vec();
 
         let fields = [column_fields, outbound_relationship_fields].concat();
+        let name = String::from(&self.graphql_name.as_ref().unwrap_or(&self.name).to_owned());
 
         graphql_parser::schema::ObjectType {
             position: Default::default(),
             description: None,
-            name: self.name.to_owned(),
+            name,
             implements_interfaces: vec![],
             directives: vec![],
             fields,
@@ -170,6 +173,7 @@ pub struct Column {
     pub datatype: String,
     pub required: bool,
     pub unique: bool,
+    pub graphql_name: Option<String>,
 }
 
 impl Column {
@@ -187,14 +191,19 @@ impl Column {
             field_type
         };
 
+        let name = String::from(self.get_graphql_field_name()).to_owned();
+
         graphql_parser::schema::Field {
             position: Default::default(),
             description: None,
-            name: self.name.to_owned(),
+            name,
             arguments: vec![],
             field_type: type_with_required,
             directives: vec![],
         }
+    }
+    fn get_graphql_field_name(&self) -> &str {
+        self.graphql_name.as_ref().unwrap_or(&self.name)
     }
 }
 
@@ -228,6 +237,23 @@ pub struct PostgresTableRow {
     comment: Option<String>,
 }
 
+//Regex::new(r"(?P<INOUT>(INOUT|OUT))? ?(?P<NAME>\w*) (?P<TYPE>\w*)").unwrap();
+// $*@rename(name)*^
+const extract_name_regex: &str = "";
+
+impl PostgresTableRow {
+    fn get_name(&self) -> &str {
+        let name_extraction_regex: Regex = Regex::new(r"^.*@rename\((?P<NAME>\w+)\).*$").unwrap();
+
+        self.comment
+            .as_ref()
+            .and_then(|str| name_extraction_regex.captures(&str))
+            .and_then(|captures| captures.name("NAME"))
+            .map(|regex_match| regex_match.as_str())
+            .unwrap_or(&self.name)
+    }
+}
+
 #[derive(sqlx::FromRow, Debug, Clone)]
 pub struct PostgresTableColummRow {
     column_name: String,
@@ -235,6 +261,28 @@ pub struct PostgresTableColummRow {
     is_nullable: String,
     data_type: String,
     comment: Option<String>,
+}
+
+impl PostgresTableColummRow {
+    fn get_name(&self) -> &str {
+        let name_extraction_regex: Regex = Regex::new(r"^.*@rename\((?P<NAME>\w+)\).*$").unwrap();
+
+        self.comment
+            .as_ref()
+            .and_then(|str| name_extraction_regex.captures(&str))
+            .and_then(|captures| captures.name("NAME"))
+            .map(|regex_match| regex_match.as_str())
+            .unwrap_or(&self.column_name)
+    }
+
+    fn get_graphql_name(&self) -> Option<String> {
+        let name_extraction_regex: Regex = Regex::new(r"^.*@rename\((?P<NAME>\w+)\).*$").unwrap();
+        self.comment
+            .as_ref()
+            .and_then(|str| name_extraction_regex.captures(&str))
+            .and_then(|captures| captures.name("NAME"))
+            .map(|regex_match| String::from(regex_match.as_str()))
+    }
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
@@ -315,11 +363,17 @@ struct SqlQueryExecution {
     binds: Vec<String>,
 }
 
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
+struct QueryColumn {
+    column_name: String,
+    column_name_alias: Option<String>,
+}
+
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum SqlQuery {
     TableSelection {
         table_name: String,
-        column_names: Vec<String>,
+        column_names: Vec<QueryColumn>,
         left_joins: Vec<LeftJoin>,
         where_clauses: Vec<WhereClause>,
         pagination: Option<TablePagination>,
@@ -329,7 +383,7 @@ enum SqlQuery {
     },
     FunctionSelection {
         function_name: String,
-        column_names: Vec<String>,
+        column_names: Vec<QueryColumn>,
         left_joins: Vec<LeftJoin>,
         where_clauses: Vec<WhereClause>,
         pagination: Option<TablePagination>,
@@ -403,7 +457,7 @@ impl SqlQuery {
         }
     }
 
-    fn get_column_names(&self) -> &Vec<String> {
+    fn get_column_names(&self) -> &Vec<QueryColumn> {
         match self {
             SqlQuery::TableSelection { column_names, .. } => column_names,
             SqlQuery::FunctionSelection { column_names, .. } => column_names,
@@ -527,7 +581,14 @@ impl SqlQuery {
         .iter()
         .map(|col_name| {
             let path = self.get_path();
-            format!(r#""{}_data"."{}" as "{}""#, path, col_name, col_name)
+            let out_name = col_name
+                .column_name_alias
+                .as_ref()
+                .unwrap_or(&col_name.column_name);
+            format!(
+                r#""{}_data"."{}" as "{}""#,
+                path, col_name.column_name, out_name
+            )
         });
         let data_select = self.to_data_select_sql();
 
@@ -817,6 +878,7 @@ fn field_to_table_selection(
                 todo!()
             }
         });
+
     let join_fields = field
         .selection_set
         .items
@@ -837,13 +899,16 @@ fn field_to_table_selection(
             }
         });
 
-    let columns: Result<Vec<String>, String> = col_fields
+    let columns: Result<Vec<QueryColumn>, String> = col_fields
         .map(|field| {
             let col = table
                 .get_all_columns()
-                .find(|col| col.name.eq(&field.name))
+                .find(|col| col.get_graphql_field_name().eq(&field.name))
                 .ok_or("Unable to find column");
-            Ok(col?.name.to_string())
+            Ok(QueryColumn {
+                column_name: col?.name.to_string(),
+                column_name_alias: col?.graphql_name.to_owned(),
+            })
         })
         .collect();
 
@@ -1087,7 +1152,7 @@ fn field_to_table_selection(
         .map_ok(|(joined_table, relationship)| LeftJoin {
             right_table: joined_table,
             join_conditions: vec![JoinCondition {
-                left_col: relationship.field_name.to_owned(),
+                left_col: relationship.column_name.to_owned(),
                 right_col: relationship.target_column_name.to_owned(),
             }],
         })
@@ -2139,6 +2204,60 @@ mod tests {
         let actual = doc.format(&Style::default());
 
         let expected = "type test {\n  b: String\n  a: Integer!\n  test2: [test!]\n}\n\ntype test2 {\n  d: Integer\n  c: Integer!\n  test: test2!\n}\n\ntype query {\n  get_test_by_id(a: Integer): test\n  list_test(limit: Integer, offset: Integer): [test!]\n  get_test2_by_id(c: Integer): test2\n  list_test2(limit: Integer, offset: Integer): [test2!]\n}\n\nschema {\n  query: query\n}\n";
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simple_table_rename() -> Result<(), String> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text)"),
+            String::from("comment on table test is '@rename(hello)'"),
+            String::from("insert into test values(1, 'rune')"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                get_hello_by_id(a: 1) {
+                    a
+                    b
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(&init_sql, graphql_query).await?;
+        let expected = serde_json::json!({"a": 1, "b": "rune"});
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simple_column_rename() -> Result<(), String> {
+        let init_sql = vec![
+            String::from("create table test(a int primary key, b text)"),
+            String::from("comment on column test.b is '@rename(b_renamed)'"),
+            String::from("insert into test values(1, 'rune')"),
+        ];
+
+        let graphql_query = String::from(
+            r#"
+            query test {
+                get_test_by_id(a: 1) {
+                    a
+                    b_renamed
+                }
+            }
+            "#,
+        );
+
+        let actual = base_test(&init_sql, graphql_query).await?;
+        let expected = serde_json::json!({"a": 1, "b_renamed": "rune"});
 
         assert_eq!(expected, actual);
 

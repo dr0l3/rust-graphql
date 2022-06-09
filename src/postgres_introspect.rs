@@ -163,7 +163,7 @@ pub fn convert_introspect_data(
             table
                 .comment
                 .as_ref()
-                .map_or(true, |str| str.contains("@ignore"))
+                .map_or(true, |str| !str.contains("@ignore"))
         })
         .map(|table| {
             (
@@ -187,14 +187,14 @@ pub fn convert_introspect_data(
 
     let tables = introspection_results
         .iter()
-        .map(|(table, columns, constraints)| {
-            let cols: Vec<Column> = columns
+        .map(|(table_row, column_rows, constraint_rows)| {
+            let cols: Vec<Column> = column_rows
                 .iter()
                 .map(|col| Column {
                     name: col.column_name.to_string(),
                     datatype: col.data_type.to_string(),
                     required: col.is_nullable.contains("NO"),
-                    unique: constraints
+                    unique: constraint_rows
                         .iter()
                         .filter(|contraint| {
                             contraint.constraint_type.contains("UNIQUE")
@@ -207,9 +207,10 @@ pub fn convert_introspect_data(
                                 .contains(&col.column_name.to_string())
                         })
                         .is_some(),
+                    graphql_name: col.get_graphql_name(),
                 })
                 .collect_vec();
-            let pk_contraints = constraints
+            let pk_contraints = constraint_rows
                 .iter()
                 .filter(|constraint| constraint.constraint_type.contains("PRIMARY KEY"))
                 .collect_vec();
@@ -238,8 +239,8 @@ pub fn convert_introspect_data(
             let non_pk_indexed_cols = indexed_columns
                 .iter()
                 .filter(|indexed_columns| {
-                    indexed_columns.table_name == table.name
-                        && indexed_columns.schema_name == table.schema
+                    indexed_columns.table_name == table_row.name
+                        && indexed_columns.schema_name == table_row.schema
                 })
                 .filter(|index| match &index.column_names[..] {
                     index_col_names if index_col_names.len() == primary_keys.len() => {
@@ -258,10 +259,10 @@ pub fn convert_introspect_data(
                 .filter(|function| match &function.return_type {
                     PostgresFunctionReturn::Scalar => false,
                     PostgresFunctionReturn::SingleObject { table_name } => {
-                        table_name.eq(&table.name)
+                        table_name.eq(&table_row.name)
                     }
                     PostgresFunctionReturn::SetOfObject { table_name } => {
-                        table_name.eq(&table.name)
+                        table_name.eq(&table_row.name)
                     }
                 })
                 .map(|function| {
@@ -290,7 +291,7 @@ pub fn convert_introspect_data(
             let indexed_cols_ops = non_pk_indexed_cols
                 .iter()
                 .map(|indexed_columns| {
-                    let column_combination_unique = constraints
+                    let column_combination_unique = constraint_rows
                         .iter()
                         .filter(|constraint| constraint.constraint_type == "UNIQUE")
                         .map(|constraint| &constraint.key_columns)
@@ -351,7 +352,7 @@ pub fn convert_introspect_data(
             let toplevel_ops: Vec<Operation> = if !primary_keys.is_empty() {
                 let base = vec![
                     Operation {
-                        name: format!("get_{}_by_id", table.name),
+                        name: format!("get_{}_by_id", table_row.get_name()),
                         return_type: ReturnType::Object,
                         args: primary_keys
                             .iter()
@@ -369,7 +370,7 @@ pub fn convert_introspect_data(
                         return_type_optional: true,
                     },
                     Operation {
-                        name: format!("list_{}", table.name),
+                        name: format!("list_{}", table_row.get_name()),
                         return_type: ReturnType::Array,
                         args: vec![
                             Arg {
@@ -401,13 +402,14 @@ pub fn convert_introspect_data(
             };
 
             DatabaseTable {
-                name: table.name.to_string(),
+                name: table_row.name.to_string(),
                 columns: regular_cols,
                 primary_keys: primary_keys
                     .iter()
                     .map(|col| PrimaryKey(col.to_owned().to_owned()))
                     .collect_vec(),
                 toplevel_ops,
+                graphql_name: None,
             }
         })
         .collect_vec();
@@ -489,7 +491,14 @@ pub fn convert_introspect_data(
                     column_name: column.name.to_string(),
                     target_table_name: foreign_table.name.to_string(),
                     target_column_name: foreign_column.name.to_string(),
-                    field_name: format!("{}", foreign_table.name.to_string()),
+                    field_name: format!(
+                        "{}",
+                        foreign_table
+                            .graphql_name
+                            .as_ref()
+                            .unwrap_or(&foreign_table.name)
+                            .to_string()
+                    ),
                     return_type,
                     column_optional: !column.required,
                 },
@@ -498,7 +507,7 @@ pub fn convert_introspect_data(
                     column_name: foreign_column.name.to_string(),
                     target_table_name: table.name.to_string(),
                     target_column_name: column.name.to_string(),
-                    field_name: format!("{}", table.name), // TODO: Better
+                    field_name: format!("{}", table.graphql_name.as_ref().unwrap_or(&table.name)), // TODO: Better
                     return_type: second_return_type,
                     column_optional: !foreign_column.required,
                 },
