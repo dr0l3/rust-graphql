@@ -12,10 +12,10 @@
 - And only using inline variable
 - Functions
   - As top level operations
+- GraphQL schema introspection
 
 # Non working stuff
 - Fragments
-- GraphQL schema introspection
 - Other operations
   - Update
   - Insert

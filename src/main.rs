@@ -14,11 +14,28 @@ use graphql_parser::query::{
 };
 use graphql_parser::schema::Value;
 use itertools::{concat, Itertools};
+use num_traits::cast::ToPrimitive;
 use postgres_introspect::{convert_introspect_data, fetch_introspection_data};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::BTreeMap;
 use std::fmt::{format, Display, Formatter};
+use std::ops::{Add, Deref, DerefMut};
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
+
+#[derive(Debug)]
+struct BindCounter {
+    count: Cell<u32>,
+}
+
+impl BindCounter {
+    fn get_current_and_advance(&self) -> u32 {
+        let current = self.count.get();
+        self.count.set(current + 1);
+        current
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DatabaseTable {
@@ -264,6 +281,8 @@ async fn main() -> Result<(), String> {
             .map_err(|err| err.to_string())
             .await?;
 
+    // sqlx::query("select * from hello where a = ?").bind(sqlx::types::Uuid::from(Uuid::new_v4()));
+
     println!("{:#?}", functions);
 
     let results =
@@ -272,15 +291,26 @@ async fn main() -> Result<(), String> {
     Ok(())
 }
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct LimitOffsetBind {
+    number: u32,
+    value: u32,
+}
+
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct TablePagination {
-    limit: u32,
-    offset: u32,
+    limit: LimitOffsetBind,
+    offset: LimitOffsetBind,
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct FunctionSelectionArgument {
     value: String,
     quoted: bool,
+}
+#[derive(Debug, Eq, PartialOrd, PartialEq, Ord)]
+struct SqlQueryExecution {
+    query: SqlQuery,
+    binds: Vec<String>,
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -330,10 +360,24 @@ struct JoinCondition {
 }
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+enum BindValue {
+    Text(String),
+    Number(i64),
+    Bool(bool),
+    Uuid(sqlx::types::Uuid),
+}
+
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+enum WhereClauseRightSide {
+    ColumnName(String),
+    Bind(u32, BindValue),
+}
+
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 struct WhereClause {
     path: Option<String>,
     column_name: String,
-    expr: String,
+    expr: WhereClauseRightSide,
 }
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Copy)]
@@ -406,8 +450,14 @@ impl SqlQuery {
                         format!(r#""{}_data"."#, path).to_string()
                     });
                     let left_side = format!(r#"{}"{}""#, path_string, column_name);
+                    let right_side = match expr {
+                        WhereClauseRightSide::ColumnName(name) => name.to_string(),
+                        WhereClauseRightSide::Bind(number, _) => {
+                            format!("${}", number)
+                        }
+                    };
 
-                    format!(r#"{} = {}"#, left_side, expr)
+                    format!(r#"{} = {}"#, left_side, right_side)
                 },
             )
             .join(" AND ");
@@ -421,7 +471,10 @@ impl SqlQuery {
         let pagination = self
             .get_pagination()
             .as_ref()
-            .map(|pag| format!("limit {} offset {}", pag.limit, pag.offset))
+            .map(|pag| {
+                let dollar = "$";
+                format!(r"limit ${} offset ${}", pag.limit.number, pag.offset.number)
+            })
             .unwrap_or(String::from(""));
 
         let from = match self {
@@ -546,6 +599,138 @@ impl SqlQuery {
             selector = selector
         )
     }
+
+    fn extract_binds_sorted(&self) -> Vec<BindValue> {
+        self.extract_binds()
+            .into_iter()
+            .sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
+            .map(|(_, v)| v.to_owned())
+            .collect_vec()
+    }
+
+    fn extract_binds(&self) -> Vec<(u32, BindValue)> {
+        match self {
+            SqlQuery::TableSelection {
+                where_clauses,
+                pagination,
+                left_joins,
+                ..
+            } => {
+                let where_binds = where_clauses
+                    .iter()
+                    .filter_map(|clause| match &clause.expr {
+                        WhereClauseRightSide::ColumnName(_) => None,
+                        WhereClauseRightSide::Bind(n, v) => Some((n.to_owned(), v.to_owned())),
+                    })
+                    .collect_vec();
+
+                let pagination_binds: Vec<(u32, BindValue)> = match pagination {
+                    None => {
+                        vec![]
+                    }
+                    Some(pag) => {
+                        vec![
+                            (
+                                pag.offset.number,
+                                BindValue::Number(pag.offset.value as i64),
+                            ),
+                            (pag.limit.number, BindValue::Number(pag.limit.value as i64)),
+                        ]
+                    }
+                };
+
+                let left_join_binds = left_joins
+                    .iter()
+                    .flat_map(|left_join| left_join.right_table.extract_binds())
+                    .collect_vec();
+
+                [where_binds, pagination_binds, left_join_binds].concat()
+            }
+            SqlQuery::FunctionSelection {
+                where_clauses,
+                pagination,
+                left_joins,
+                ..
+            } => {
+                let where_binds = where_clauses
+                    .iter()
+                    .filter_map(|clause| match &clause.expr {
+                        WhereClauseRightSide::ColumnName(_) => None,
+                        WhereClauseRightSide::Bind(n, v) => Some((n.to_owned(), v.to_owned())),
+                    })
+                    .collect_vec();
+
+                let pagination_binds: Vec<(u32, BindValue)> = match pagination {
+                    None => {
+                        vec![]
+                    }
+                    Some(pag) => {
+                        vec![
+                            (
+                                pag.offset.number,
+                                BindValue::Number(pag.offset.value as i64),
+                            ),
+                            (pag.limit.number, BindValue::Number(pag.limit.value as i64)),
+                        ]
+                    }
+                };
+
+                let left_join_binds = left_joins
+                    .iter()
+                    .flat_map(|left_join| left_join.right_table.extract_binds())
+                    .collect_vec();
+
+                [where_binds, pagination_binds, left_join_binds].concat()
+            }
+        }
+    }
+
+    fn count_binds_used(&self) -> u32 {
+        match self {
+            SqlQuery::TableSelection {
+                where_clauses,
+                pagination,
+                left_joins,
+                ..
+            } => {
+                let where_binds = where_clauses.len().to_u32().unwrap();
+                let pagination_binds = match pagination {
+                    None => 0,
+                    Some(_) => 2,
+                }
+                .to_u32()
+                .unwrap();
+
+                let left_join_binds: u32 = left_joins
+                    .iter()
+                    .map(|left_join| left_join.right_table.count_binds_used())
+                    .sum();
+
+                where_binds + pagination_binds + left_join_binds
+            }
+            SqlQuery::FunctionSelection {
+                where_clauses,
+                pagination,
+                left_joins,
+                ..
+            } => {
+                let where_binds = where_clauses.len().to_u32().unwrap();
+                let pagination_binds = match pagination {
+                    None => 0,
+                    Some(_) => 2,
+                }
+                .to_u32()
+                .unwrap();
+
+                let left_join_binds: u32 = left_joins
+                    .iter()
+                    .map(|left_join| left_join.right_table.count_binds_used())
+                    .sum();
+
+                where_binds + pagination_binds + left_join_binds
+            }
+        }
+    }
 }
 
 // fn inner(selection: &Selection) -> Field {
@@ -590,6 +775,7 @@ fn field_to_table_selection(
     introspection: &IntrospectionResult,
     search_place: &SearchPlace,
     path: String,
+    counter: &BindCounter,
 ) -> SqlQuery {
     let field_name = field.name.to_owned();
     let selectable = introspection.selectable_by_operation_name.get(&field_name);
@@ -678,40 +864,6 @@ fn field_to_table_selection(
 
     println!("{:#?}", joins);
 
-    // I do know which joins have been selected
-    // I do know which table "this" field corresponds to
-    // I need to produce a left join
-    // - right table (get from recursive call)
-    // - left col (have that from relationship)
-    // - right col (have tha from relationship)
-    let selected_joins = joins
-        .iter()
-        .map(|(field, relationship)| {
-            let relationship_param = relationship.to_owned();
-            let updated_path = format!("{}.{}", path, field.name);
-
-            (
-                field_to_table_selection(
-                    &field,
-                    introspection,
-                    &SearchPlace::Relationship {
-                        relationship: relationship_param,
-                        path: path.to_owned(),
-                    },
-                    updated_path,
-                ),
-                relationship,
-            )
-        })
-        .map(|(joined_table, relationship)| LeftJoin {
-            right_table: joined_table,
-            join_conditions: vec![JoinCondition {
-                left_col: relationship.field_name.to_owned(),
-                right_col: relationship.target_column_name.to_owned(),
-            }],
-        })
-        .collect_vec();
-
     let where_clauses = match search_place {
         SearchPlace::TopLevel => {
             let op = table
@@ -727,31 +879,56 @@ fn field_to_table_selection(
                     let field_arg = field
                         .arguments
                         .iter()
-                        .find(|(name, value)| name.eq(&op_arg.name))
+                        .find(|(name, _)| name.eq(&op_arg.name))
                         .map(|(_, value)| value.to_string());
 
                     WhereClause {
                         path: None,
                         column_name: op_arg.name.to_owned(),
                         expr: match &op_arg.tpe {
-                            InputType::GraphQLInteger { default } => field_arg
-                                .or(default.map(|num| num.to_string()))
-                                .expect("Unable to extract value for arg"),
-                            InputType::GraphQLString { default } => field_arg
-                                .or(default.to_owned())
-                                .map(|field_value| {
-                                    format!(r#"'{}'"#, field_value.trim_matches('"'))
-                                })
-                                .expect("Unable to extract value for arg"),
-                            InputType::GraphQLBoolean { default } => field_arg
-                                .or(default.map(|v| v.to_string()))
-                                .expect("Unable to extract value for arg"),
-                            InputType::GraphQLID { default } => field_arg
-                                .or(default.to_owned())
-                                .map(|field_value| {
-                                    format!(r#"'{}'"#, field_value.trim_matches('"'))
-                                })
-                                .expect("Unable to extract value for arg"),
+                            InputType::GraphQLInteger { default } => WhereClauseRightSide::Bind(
+                                counter.get_current_and_advance(),
+                                BindValue::Number(
+                                    field_arg
+                                        .or(default.map(|num| num.to_string()))
+                                        .expect("Unable to extract value for arg")
+                                        .parse()
+                                        .unwrap(),
+                                ),
+                            ),
+                            InputType::GraphQLString { default } => WhereClauseRightSide::Bind(
+                                counter.get_current_and_advance(),
+                                BindValue::Text(
+                                    field_arg
+                                        .or(default.to_owned())
+                                        .map(|field_value| {
+                                            format!(r#"{}"#, field_value.trim_matches('"'))
+                                        })
+                                        .expect("Unable to extract value for arg"),
+                                ),
+                            ),
+                            InputType::GraphQLBoolean { default } => WhereClauseRightSide::Bind(
+                                counter.get_current_and_advance(),
+                                BindValue::Bool(
+                                    field_arg
+                                        .map(|v| v.parse::<bool>().unwrap())
+                                        .or(*default)
+                                        .expect("Unable to extract value for arg"),
+                                ),
+                            ),
+                            InputType::GraphQLID { default } => WhereClauseRightSide::Bind(
+                                counter.get_current_and_advance(),
+                                BindValue::Uuid(
+                                    field_arg
+                                        .or(default.to_owned())
+                                        .map(|field_value| {
+                                            let wat =
+                                                format!(r#"{}"#, field_value.trim_matches('"'));
+                                            sqlx::types::Uuid::parse_str(&wat).unwrap()
+                                        })
+                                        .expect("Unable to extract value for arg"),
+                                ),
+                            ),
                         },
                     }
                 })
@@ -761,7 +938,10 @@ fn field_to_table_selection(
             vec![WhereClause {
                 path: Some(path.to_string()),
                 column_name: relationship.column_name.to_string(),
-                expr: format!(r#""{}""#, relationship.target_column_name.to_string()),
+                expr: WhereClauseRightSide::ColumnName(format!(
+                    r#""{}""#,
+                    relationship.target_column_name.to_string()
+                )),
             }]
         }
     };
@@ -815,14 +995,26 @@ fn field_to_table_selection(
                     }));
 
             Some(TablePagination {
-                limit: limit_arg.unwrap_or(25u32),
-                offset: offset_arg.unwrap_or(0),
+                limit: LimitOffsetBind {
+                    number: counter.get_current_and_advance(),
+                    value: limit_arg.unwrap_or(25u32),
+                },
+                offset: LimitOffsetBind {
+                    number: counter.get_current_and_advance(),
+                    value: offset_arg.unwrap_or(0),
+                },
             })
         }
         SearchPlace::Relationship { relationship, .. } => match relationship.return_type {
             ReturnType::Object => Some(TablePagination {
-                limit: 1,
-                offset: 0,
+                limit: LimitOffsetBind {
+                    number: counter.get_current_and_advance(),
+                    value: 1,
+                },
+                offset: LimitOffsetBind {
+                    number: counter.get_current_and_advance(),
+                    value: 0,
+                },
             }),
             ReturnType::Array => {
                 let limit_arg = field
@@ -838,8 +1030,14 @@ fn field_to_table_selection(
                     .map(|(_, value)| value.to_string().parse::<u32>().unwrap());
 
                 Some(TablePagination {
-                    limit: limit_arg.unwrap_or(25u32),
-                    offset: offset_arg.unwrap_or(0),
+                    limit: LimitOffsetBind {
+                        number: counter.get_current_and_advance(),
+                        value: limit_arg.unwrap_or(25u32),
+                    },
+                    offset: LimitOffsetBind {
+                        number: counter.get_current_and_advance(),
+                        value: offset_arg.unwrap_or(0),
+                    },
                 })
             }
         },
@@ -856,6 +1054,40 @@ fn field_to_table_selection(
         }
         SearchPlace::Relationship { relationship, .. } => relationship.return_type,
     };
+
+    // I do know which joins have been selected
+    // I do know which table "this" field corresponds to
+    // I need to produce a left join
+    // - right table (get from recursive call)
+    // - left col (have that from relationship)
+    // - right col (have tha from relationship)
+    let selected_joins = joins
+        .iter()
+        .map(|(field, relationship)| {
+            let relationship_param = relationship.to_owned();
+            let updated_path = format!("{}.{}", path, field.name);
+
+            let wat = field_to_table_selection(
+                &field,
+                introspection,
+                &SearchPlace::Relationship {
+                    relationship: relationship_param,
+                    path: path.to_owned(),
+                },
+                updated_path,
+                counter,
+            );
+
+            (wat, relationship)
+        })
+        .map(|(joined_table, relationship)| LeftJoin {
+            right_table: joined_table,
+            join_conditions: vec![JoinCondition {
+                left_col: relationship.field_name.to_owned(),
+                right_col: relationship.target_column_name.to_owned(),
+            }],
+        })
+        .collect_vec();
 
     match search_place {
         SearchPlace::TopLevel => match selectable.expect("Unable to find selectable") {
@@ -917,6 +1149,10 @@ fn field_to_table_selection(
 fn to_intermediate(query: &Document<String>, introspection: &IntrospectionResult) -> Vec<SqlQuery> {
     let ops = query.definitions.to_owned();
 
+    let counter = BindCounter {
+        count: Cell::new(1),
+    };
+
     ops.iter()
         .flat_map(|operation_definition| match operation_definition {
             Definition::Operation(op) => match op {
@@ -927,6 +1163,7 @@ fn to_intermediate(query: &Document<String>, introspection: &IntrospectionResult
                             introspection,
                             &SearchPlace::TopLevel,
                             "root".to_string(),
+                            &counter,
                         ),
                         Selection::FragmentSpread(_) => {
                             todo!()
@@ -956,7 +1193,7 @@ fn to_intermediate(query: &Document<String>, introspection: &IntrospectionResult
 #[cfg(test)]
 mod tests {
     use crate::{
-        convert_introspect_data, fetch_introspection_data, select, to_intermediate, Arg,
+        convert_introspect_data, fetch_introspection_data, select, to_intermediate, Arg, BindValue,
         DatabaseRelationship, InputType, JoinCondition, LeftJoin, Operation, ReturnType,
         SearchPlace, SqlQuery, TryFutureExt, WhereClause,
     };
@@ -977,7 +1214,7 @@ mod tests {
     use graphql_parser::schema::Document;
     use itertools::Itertools;
     use sqlx::query::Query;
-    use sqlx::{postgres::PgPoolOptions, Error, Pool, Postgres, Row};
+    use sqlx::{postgres::types::*, postgres::PgPoolOptions, Error, Pool, Postgres, Row};
     use testcontainers::core::WaitFor;
 
     #[derive(Debug, Derivative)]
@@ -1008,6 +1245,11 @@ mod tests {
         fn env_vars(&self) -> Box<dyn Iterator<Item = (&String, &String)> + '_> {
             Box::new(self.env_vars.iter())
         }
+    }
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct Whatever {
+        root: serde_json::Value,
     }
 
     async fn base_test(sql: Vec<String>, query: String) -> Result<serde_json::Value, Error> {
@@ -1050,22 +1292,55 @@ mod tests {
 
         println!("{:#?}", intermediate);
 
-        let executable_sql = intermediate
+        // let executable_sql = intermediate
+        //     .iter()
+        //     .map(|inter| inter.to_json_sql().to_owned())
+        //     .collect_vec()
+        //     .first()
+        //     .unwrap()
+        //     .to_owned();
+
+        let sqlquery = &intermediate[0];
+        let sql = sqlquery.to_json_sql();
+        let binds = sqlquery.extract_binds_sorted();
+
+        let formatted_binds = binds
             .iter()
-            .map(|inter| inter.to_json_sql().to_owned())
-            .collect_vec()
-            .first()
-            .unwrap()
-            .to_owned();
+            .map(|bind| match bind {
+                BindValue::Text(t) => t.to_string(),
+                BindValue::Number(b) => b.to_string(),
+                BindValue::Bool(b) => b.to_string(),
+                BindValue::Uuid(b) => b.to_string(),
+            })
+            .collect_vec();
 
         println!(
             "{}",
-            format(&executable_sql, &QueryParams::None, Default::default())
+            format(
+                &sql,
+                &QueryParams::Indexed(formatted_binds),
+                Default::default()
+            )
         );
+        println!("");
+        println!("{:#?}", sql);
+        println!("{:#?}", binds);
 
-        let res: (serde_json::Value,) = sqlx::query_as(&executable_sql).fetch_one(&pool).await?;
+        let base_query = sqlx::query(&sql);
+        let hmm = binds.into_iter().fold(base_query, |q, n| match n {
+            BindValue::Text(t) => q.bind(t),
+            BindValue::Number(n) => q.bind(n),
+            BindValue::Bool(b) => q.bind(b),
+            BindValue::Uuid(b) => q.bind(b),
+        });
+
+        let res2 = hmm.fetch_one(&pool).await;
+
+        //println!("{:?}", res2);
+
+        //let res: (serde_json::Value,) = sqlx::query_as(&executable_sql).fetch_one(&pool).await?;
         pg.stop();
-        Ok(res.0)
+        res2.map(|omg| omg.get(0))
     }
 
     async fn base_test_schema(sql: Vec<String>) -> Result<Document<'static, String>, Error> {
